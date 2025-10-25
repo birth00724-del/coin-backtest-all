@@ -48,7 +48,7 @@ def load_upbit_csv(path: str) -> pd.DataFrame:
     return df
 
 try:
-    data = load_upbit_csv("upbit_KRW-BTC_daily_all.csv")
+    data = load_upbit_csv("upbit_krw_btc_daily_all.csv")
     st.success(f"✅ CSV 로드 성공: {len(data):,}행 (기간: {data.index.min().date()} ~ {data.index.max().date()})")
 except Exception as e:
     st.error(f"❌ CSV 로드 실패: {e}")
