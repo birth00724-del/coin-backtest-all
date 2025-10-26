@@ -2,10 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import json
 
-st.set_page_config(page_title="TV-Style Supertrend + VWMA Filter Backtester", layout="wide")
-st.title("📈 Supertrend(TradingView) 3중 결합 + VWMA 필터 — KST 기준 / 프리셋 저장·불러오기")
+st.set_page_config(page_title="TV-Style Supertrend + VWMA + VPVR-DVA Backtester", layout="wide")
+st.title("📈 Supertrend(TradingView) 3중 결합 + VWMA 필터 + VPVR DVA (102일 롤링) — 프리셋 저장·불러오기")
 
 # =========================================================
 # 0) 유틸: 안전 클램프 / 프리셋 보정
@@ -33,6 +32,7 @@ def sanitize_preset(p):
         # 전략 선택
         "use_st": bool(p.get("use_st", True)),
         "use_vwma": bool(p.get("use_vwma", False)),
+        "use_vpvr": bool(p.get("use_vpvr", False)),
 
         # ST 파라미터
         "ST1_L": clamp_int(p.get("ST1_L", 10), 5, 200),
@@ -42,8 +42,11 @@ def sanitize_preset(p):
         "ST3_L": clamp_int(p.get("ST3_L", 30), 5, 200),
         "ST3_M": clamp_float(p.get("ST3_M", 5.0), 0.5, 10.0),
 
-        # VWMA 파라미터
+        # VWMA
         "VWMA_L": clamp_int(p.get("VWMA_L", 20), 2, 300),
+
+        # VPVR
+        "VPVR_BINS": clamp_int(p.get("VPVR_BINS", 64), 20, 200),  # 가로 bin 수 (102일 고정)
 
         # 실행 설정
         "slippage_pct": clamp_float(p.get("slippage_pct", 0.1), 0.0, 5.0),
@@ -88,7 +91,6 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
     dir_long.iloc[0]    = True  # 시작값 임의
 
     for i in range(1, len(d)):
-        # 계단식(보수적 유지)
         final_upper.iloc[i] = (
             basic_upper.iloc[i] if (c.iloc[i-1] > final_upper.iloc[i-1])
             else min(basic_upper.iloc[i], final_upper.iloc[i-1])
@@ -98,7 +100,6 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
             else max(basic_lower.iloc[i], final_lower.iloc[i-1])
         )
 
-        # 이전 final line 기준 교차 판정
         prev_line = final_lower.iloc[i-1] if dir_long.iloc[i-1] else final_upper.iloc[i-1]
         if c.iloc[i] > prev_line:
             dir_long.iloc[i] = True
@@ -108,7 +109,7 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
             dir_long.iloc[i] = dir_long.iloc[i-1]
 
     out = pd.DataFrame(index=d.index)
-    out["ST_trend"] = dir_long         # True=상승, False=하락
+    out["ST_trend"] = dir_long
     out["Upper"]    = final_upper
     out["Lower"]    = final_lower
     out["ST_line"]  = np.where(dir_long, final_lower, final_upper).astype(float)
@@ -116,7 +117,6 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
 
 # =========================================================
 # 3) VWMA (거래량가중이동평균)
-#     VWMA_t = sum(Close*Volume, w) / sum(Volume, w)
 # =========================================================
 def compute_vwma(df: pd.DataFrame, window: int) -> pd.Series:
     if "Volume" not in df.columns:
@@ -125,14 +125,83 @@ def compute_vwma(df: pd.DataFrame, window: int) -> pd.Series:
     c = pd.to_numeric(df["Close"], errors="coerce")
     num = (c * v).rolling(window, min_periods=window).sum()
     den = v.rolling(window, min_periods=window).sum()
-    vwma = num / den
-    return vwma
+    return num / den
 
 # =========================================================
-# 4) 백테스트 (조건 고정 + 선택적 VWMA 필터)
-#    - 매수: ST 3개 모두 상승(True)
-#            + (두 전략 모두 선택된 경우) Close > VWMA(window)
-#    - 매도: ST 3개 중 1개라도 하락(False)  ※ VWMA는 매도에 관여하지 않음
+# 4) VPVR DVA (102일 롤링) — DVAL/ DVAH 산출
+#   - 창: 고정 102일
+#   - bins: 사용자가 조절 가능 (기본 64)
+#   - 방법: 창 구간에서 '종가에 모든 거래량을 귀속' (일봉 데이터 한계)
+#           볼륨 프로파일로 POC 찾고, 양옆으로 확장하며 누적 70% 도달 구간 = VA
+# =========================================================
+def compute_vpvr_dva(df: pd.DataFrame, window: int = 102, bins: int = 64):
+    if "Volume" not in df.columns:
+        return pd.Series(index=df.index, dtype=float) * np.nan, pd.Series(index=df.index, dtype=float) * np.nan
+
+    close = pd.to_numeric(df["Close"], errors="coerce").astype(float)
+    vol   = pd.to_numeric(df["Volume"], errors="coerce").astype(float)
+
+    idx = df.index
+    DVAL = pd.Series(index=idx, dtype=float)
+    DVAH = pd.Series(index=idx, dtype=float)
+
+    # 미리 numpy로
+    c_vals = close.values
+    v_vals = vol.values
+
+    for end in range(window - 1, len(df)):
+        start = end - window + 1
+        c_win = c_vals[start:end+1]
+        v_win = v_vals[start:end+1]
+        if np.any(np.isnan(c_win)) or np.any(np.isnan(v_win)):
+            continue
+
+        lo = np.min(c_win)
+        hi = np.max(c_win)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            continue
+
+        # bin 경계
+        edges = np.linspace(lo, hi, bins + 1)
+        # 각 일자 종가를 해당 bin에 할당 (일봉이라 종가에 전량 귀속)
+        bin_idx = np.clip(np.digitize(c_win, edges) - 1, 0, bins - 1)
+        vol_hist = np.bincount(bin_idx, weights=v_win, minlength=bins).astype(float)
+
+        total = vol_hist.sum()
+        if total <= 0:
+            continue
+
+        poc = int(np.argmax(vol_hist))
+        target = 0.7 * total
+        cum = vol_hist[poc]
+        left = poc - 1
+        right = poc + 1
+        min_i = poc
+        max_i = poc
+
+        while cum < target and (left >= 0 or right < bins):
+            lv = vol_hist[left] if left >= 0 else -1.0
+            rv = vol_hist[right] if right < bins else -1.0
+            if rv > lv:
+                cum += max(rv, 0.0)
+                max_i = right
+                right += 1
+            else:
+                cum += max(lv, 0.0)
+                min_i = left
+                left -= 1
+
+        # VA 경계: 하한=edges[min_i], 상한=edges[max_i+1]
+        DVAL.iloc[end] = float(edges[min_i])
+        DVAH.iloc[end] = float(edges[max_i + 1])
+
+    return DVAL, DVAH
+
+# =========================================================
+# 5) 백테스트 (ST + 선택적 VWMA + 선택적 VPVR-DVA)
+#    - 기본(ST): 3개 모두 상승(True) → 매수 후보 / 1개라도 하락(False) → 매도 후보
+#    - VWMA(선택): 매수 시 Close > VWMA 여야 함 (매도엔 미개입)
+#    - VPVR-DVA(선택): 매수 시 Close > DVAH 여야 함, 또한 Close <= DVAH면 즉시 매도
 #    - 체결: 선택형 (당일 종가 / 다음날 시가 / 다음날 종가)
 # =========================================================
 def execute_backtest(
@@ -142,24 +211,41 @@ def execute_backtest(
     slippage: float,
     initial_capital: float,
     use_vwma: bool = False,
-    vwma_len: int = 20
+    vwma_len: int = 20,
+    use_vpvr: bool = False,
+    vpvr_bins: int = 64,
 ):
-    # ST 3개
+    # Supertrend 3개
     st_frames = [supertrend_tv(data, int(L), float(M)) for (L, M) in st_cfgs]
     trends = pd.concat([f["ST_trend"] for f in st_frames], axis=1)
     trends.columns = [f"ST{i+1}" for i in range(3)]
-    base_buy  = (trends.sum(axis=1) == 3)      # 3개 모두 True
-    base_sell = (trends.sum(axis=1) < 3)       # 1개라도 False
+    base_buy  = (trends.sum(axis=1) == 3)
+    base_sell = (trends.sum(axis=1) < 3)
 
-    # VWMA 필터 (선택됨 & Volume 존재 시에만 적용)
+    # VWMA
     if use_vwma:
         vwma = compute_vwma(data, int(vwma_len))
         vwma_ok = data["Close"] > vwma
         buy_sig = base_buy & vwma_ok
     else:
+        vwma = None
         buy_sig = base_buy
 
-    sell_sig = base_sell  # 매도는 ST 조건 그대로
+    # VPVR DVA
+    if use_vpvr:
+        if "Volume" not in data.columns:
+            raise ValueError("VPVR DVA를 사용하려면 CSV에 'volume' 컬럼이 필요합니다.")
+        dval, dvah = compute_vpvr_dva(data, window=102, bins=int(vpvr_bins))
+        # 매수 필터 추가
+        buy_sig = buy_sig & (data["Close"] > dvah)
+        # 매도 조건에 'Close <= DVAH' 추가 (강제 청산)
+        vpvr_sell = data["Close"] <= dvah
+    else:
+        dval = dvah = None
+        vpvr_sell = pd.Series(False, index=data.index)
+
+    # 최종 매도 시그널
+    sell_sig = base_sell | vpvr_sell
 
     # 체결 타이밍/가격
     if fill_policy == "당일 종가":
@@ -214,7 +300,7 @@ def execute_backtest(
 
         equity.append(capital if position == 0 else position * px_c)
 
-    # 마지막 강제 청산(보수적)
+    # 마지막 강제 청산
     if position > 0:
         last_px = float(data["Close"].iloc[-1]) * (1 - slippage)
         capital = position * last_px
@@ -245,10 +331,10 @@ def execute_backtest(
     else:
         cagr = mdd = sharpe = np.nan
 
-    return equity_s, pd.DataFrame(trades), cagr, mdd, sharpe, st_frames, (vwma if use_vwma else None)
+    return equity_s, pd.DataFrame(trades), cagr, mdd, sharpe, st_frames, (vwma if use_vwma else None), (dval, dvah) if use_vpvr else (None, None)
 
 # =========================================================
-# 5) CSV 업로드 (업비트: date_kst/date_utc + o/h/l/c [+ volume])
+# 6) CSV 업로드 (업비트: date_kst/date_utc + o/h/l/c [+ volume])
 # =========================================================
 uploaded = st.file_uploader("업비트 CSV 업로드 (date_kst 또는 date_utc / open / high / low / close / [volume])", type=["csv"])
 
@@ -296,17 +382,17 @@ if uploaded:
     st.success(f"✅ 로드 완료: {data.index.min().date()} ~ {data.index.max().date()} (행 {len(data):,}) — 기준: {tz_col} — 컬럼: {', '.join(keep_cols)}")
 
     # =====================================================
-    # 6) 프리셋: 저장/불러오기(안전), 적용 타이밍 개선
+    # 7) 프리셋: 저장/불러오기(안전), 적용 타이밍 개선
     # =====================================================
     if "presets" not in st.session_state:
         st.session_state["presets"] = {}
 
-    # ▶▶ 적용 대기 프리셋이 있으면 먼저 주입 (위젯 렌더 전에)
     if "_pending_preset" in st.session_state:
         safe = sanitize_preset(st.session_state["_pending_preset"])
         # 전략 선택
         st.session_state["use_st"] = safe["use_st"]
         st.session_state["use_vwma"] = safe["use_vwma"]
+        st.session_state["use_vpvr"] = safe["use_vpvr"]
         # ST
         st.session_state["ST1_L"] = safe["ST1_L"]
         st.session_state["ST1_M"] = safe["ST1_M"]
@@ -314,21 +400,22 @@ if uploaded:
         st.session_state["ST2_M"] = safe["ST2_M"]
         st.session_state["ST3_L"] = safe["ST3_L"]
         st.session_state["ST3_M"] = safe["ST3_M"]
-        # VWMA
+        # VWMA / VPVR
         st.session_state["VWMA_L"] = safe["VWMA_L"]
+        st.session_state["VPVR_BINS"] = safe["VPVR_BINS"]
         # 실행설정
         st.session_state["slippage_pct"] = safe["slippage_pct"]
         st.session_state["init_cap"] = safe["init_cap"]
         st.session_state["fill_policy"] = safe["fill_policy"]
-        # 적용 후 플래그 제거
         del st.session_state["_pending_preset"]
 
     # =====================================================
-    # 7) 사이드바 — 전략 선택 & 파라미터 (프리셋 저장/불러오기 포함)
+    # 8) 사이드바 — 전략 선택 & 파라미터
     # =====================================================
     st.sidebar.header("🧠 전략 선택")
     use_st   = st.sidebar.checkbox("수퍼트렌드 x3 사용", value=st.session_state.get("use_st", True), key="use_st")
-    use_vwma = st.sidebar.checkbox("VWMA 필터 사용 (매수 시 Close > VWMA)", value=st.session_state.get("use_vwma", False), key="use_vwma")
+    use_vwma = st.sidebar.checkbox("VWMA 필터 사용 (매수: Close > VWMA)", value=st.session_state.get("use_vwma", False), key="use_vwma")
+    use_vpvr = st.sidebar.checkbox("VPVR DVA 필터 사용 (창: 고정 102일)", value=st.session_state.get("use_vpvr", False), key="use_vpvr")
 
     st.sidebar.header("⚙️ 수퍼트렌드 파라미터")
     ST1_L = st.sidebar.number_input("ST1 기간", 5, 200, st.session_state.get("ST1_L", 10), 1, key="ST1_L")
@@ -341,6 +428,10 @@ if uploaded:
     st.sidebar.header("⚙️ VWMA 파라미터")
     VWMA_L = st.sidebar.number_input("VWMA 기간", 2, 300, st.session_state.get("VWMA_L", 20), 1, key="VWMA_L")
 
+    st.sidebar.header("⚙️ VPVR 파라미터")
+    st.sidebar.caption("기간은 고정 102일이며, 아래는 가격 축을 나누는 bin 수입니다.")
+    VPVR_BINS = st.sidebar.number_input("VPVR 가로 bin 수", 20, 200, st.session_state.get("VPVR_BINS", 64), 1, key="VPVR_BINS")
+
     st.sidebar.header("⚙️ 실행 설정")
     slippage_pct = st.sidebar.number_input("슬리피지(%)", 0.0, 5.0, st.session_state.get("slippage_pct", 0.1), 0.1, key="slippage_pct")
     init_cap     = st.sidebar.number_input("초기자산", 1.0, 1_000_000.0, st.session_state.get("init_cap", 100.0), 1.0, key="init_cap")
@@ -352,13 +443,14 @@ if uploaded:
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧩 프리셋 (저장/불러오기)")
     c1, c2 = st.sidebar.columns([2,1])
-    preset_name = c1.text_input("프리셋 이름", placeholder="예: STx3_VWMA20", key="preset_name")
+    preset_name = c1.text_input("프리셋 이름", placeholder="예: STx3_VWMA20_VPVR", key="preset_name")
     save_btn    = c2.button("저장", use_container_width=True)
 
     def current_params():
         return {
             "use_st": bool(st.session_state["use_st"]),
             "use_vwma": bool(st.session_state["use_vwma"]),
+            "use_vpvr": bool(st.session_state["use_vpvr"]),
             "ST1_L": int(st.session_state["ST1_L"]),
             "ST1_M": float(st.session_state["ST1_M"]),
             "ST2_L": int(st.session_state["ST2_L"]),
@@ -366,6 +458,7 @@ if uploaded:
             "ST3_L": int(st.session_state["ST3_L"]),
             "ST3_M": float(st.session_state["ST3_M"]),
             "VWMA_L": int(st.session_state["VWMA_L"]),
+            "VPVR_BINS": int(st.session_state["VPVR_BINS"]),
             "slippage_pct": float(st.session_state["slippage_pct"]),
             "init_cap": float(st.session_state["init_cap"]),
             "fill_policy": st.session_state["fill_policy"],
@@ -386,28 +479,29 @@ if uploaded:
         st.rerun()
 
     # ================= 실행 =================
-    if not use_st and use_vwma:
-        st.warning("VWMA 필터만으로는 매수/매도 규칙이 정의되지 않습니다. 수퍼트렌드 x3를 함께 선택하세요.")
+    if not use_st and (use_vwma or use_vpvr):
+        st.warning("VWMA/VPVR는 **필터**이므로, 수퍼트렌드 x3와 함께 사용하세요.")
     else:
-        # 데이터 길이 가드
-        max_len = max(int(ST1_L), int(ST2_L), int(ST3_L), int(VWMA_L if use_vwma else 2))
-        if len(data) < max_len + 10:
-            st.warning(f"데이터가 부족합니다. 최소 {max_len + 10}개 행 이상 필요합니다.")
+        # 데이터 길이 가드 (VPVR은 102일 필요)
+        need_len = max(int(ST1_L), int(ST2_L), int(ST3_L), 102 if use_vpvr else 2, int(VWMA_L) if use_vwma else 2)
+        if len(data) < need_len + 10:
+            st.warning(f"데이터가 부족합니다. 최소 {need_len + 10}개 행 이상 필요합니다.")
         else:
             if st.button("🚀 백테스트 실행"):
-                # VWMA 필터 선택했는데 Volume이 없으면 오류 안내
-                if use_vwma and "Volume" not in data.columns:
-                    st.error("VWMA 필터를 사용하려면 CSV에 'volume' 컬럼이 필요합니다.")
+                if (use_vwma or use_vpvr) and "Volume" not in data.columns:
+                    st.error("VWMA/VPVR을 사용하려면 CSV에 'volume' 컬럼이 필요합니다.")
                 else:
                     with st.spinner("계산 중..."):
-                        equity, trades, cagr, mdd, sharpe, st_frames, vwma_s = execute_backtest(
+                        equity, trades, cagr, mdd, sharpe, st_frames, vwma_s, (dval_s, dvah_s) = execute_backtest(
                             data,
                             [(ST1_L, ST1_M), (ST2_L, ST2_M), (ST3_L, ST3_M)],
                             fill_policy=st.session_state["fill_policy"],
                             slippage=slippage,
                             initial_capital=float(st.session_state["init_cap"]),
                             use_vwma=use_vwma,
-                            vwma_len=int(VWMA_L)
+                            vwma_len=int(VWMA_L),
+                            use_vpvr=use_vpvr,
+                            vpvr_bins=int(VPVR_BINS),
                         )
 
                     # 결과 요약
@@ -418,8 +512,8 @@ if uploaded:
                     st.write(f"**Sharpe**: {sharpe:.2f}")
                     st.write(f"**거래 횟수**: {len(trades)}")
 
-                    # 가격 + ST 라인 (+VWMA)
-                    st.subheader("📈 가격 & Supertrend (TV) " + ("+ VWMA" if use_vwma else ""))
+                    # 가격 + ST 라인 (+ VWMA + VPVR DVAL/DVAH)
+                    st.subheader("📈 가격 & Supertrend (TV) " + ("+ VWMA" if use_vwma else "") + (" + VPVR DVA(102일)" if use_vpvr else ""))
                     fig = go.Figure()
                     fig.add_trace(go.Candlestick(
                         x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"],
@@ -432,6 +526,9 @@ if uploaded:
                         fig.add_trace(go.Scatter(x=data.index, y=stf["ST_line"], mode="lines", name=f"ST{i+1} Line",  line=dict(width=2, color=colors[i])))
                     if use_vwma and vwma_s is not None:
                         fig.add_trace(go.Scatter(x=vwma_s.index, y=vwma_s.values, mode="lines", name=f"VWMA({int(VWMA_L)})", line=dict(width=2, color="#1565c0")))
+                    if use_vpvr and (dval_s is not None) and (dvah_s is not None):
+                        fig.add_trace(go.Scatter(x=dval_s.index, y=dval_s.values, mode="lines", name="DVAL(102d)", line=dict(width=1, color="#455a64", dash="dash")))
+                        fig.add_trace(go.Scatter(x=dvah_s.index, y=dvah_s.values, mode="lines", name="DVAH(102d)", line=dict(width=2, color="#1e88e5")))
 
                     fig.update_layout(template="plotly_white", xaxis_title=("date_kst" if "date_kst" in cols_lower else "date_utc"), yaxis_title="Price")
                     st.plotly_chart(fig, use_container_width=True)
