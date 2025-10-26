@@ -119,7 +119,7 @@ def compute_vwma(df: pd.DataFrame, window: int) -> pd.Series:
     return num / den
 
 # =========================================================
-# 4) VPVR DVA (백테스트용 롤링 103봉)
+# 4) VPVR DVA (롤링 103봉)
 # =========================================================
 def compute_vpvr_dva(df: pd.DataFrame, window: int = 103, bins: int = 64):
     if "Volume" not in df.columns:
@@ -136,7 +136,7 @@ def compute_vpvr_dva(df: pd.DataFrame, window: int = 103, bins: int = 64):
     v_vals = vol.values
 
     for end in range(window - 1, len(df)):
-        start = end - window + 1  # ← 103봉
+        start = end - window + 1  # 103봉
         c_win = c_vals[start:end+1]
         v_win = v_vals[start:end+1]
         if np.any(np.isnan(c_win)) or np.any(np.isnan(v_win)):
@@ -175,7 +175,6 @@ def compute_vpvr_dva(df: pd.DataFrame, window: int = 103, bins: int = 64):
 
 # =========================================================
 # 5) 백테스트 (ST + 선택적 VWMA + 선택적 VPVR-DVA)
-#    - VPVR 윈도우 = 103봉로 통일
 # =========================================================
 def execute_backtest(
     data: pd.DataFrame,
@@ -205,7 +204,7 @@ def execute_backtest(
     if use_vpvr:
         if "Volume" not in data.columns:
             raise ValueError("VPVR DVA를 사용하려면 CSV에 'volume' 컬럼이 필요합니다.")
-        dval, dvah = compute_vpvr_dva(data, window=103, bins=int(vpvr_bins))  # ★ 103봉
+        dval, dvah = compute_vpvr_dva(data, window=103, bins=int(vpvr_bins))
         buy_sig = buy_sig & (data["Close"] > dvah)
         vpvr_sell = data["Close"] <= dvah
     else:
@@ -214,6 +213,7 @@ def execute_backtest(
 
     sell_sig = base_sell | vpvr_sell
 
+    # 체결 정책
     if fill_policy == "당일 종가":
         buy_exec  = buy_sig.copy()
         sell_exec = sell_sig.copy()
@@ -378,6 +378,8 @@ if uploaded:
         st.sidebar.header("⚙️ VPVR 파라미터")
         st.sidebar.caption("백테스트는 고정 103봉(캔들) 롤링. 아래는 가격 축 분할 수입니다.")
         VPVR_BINS = st.sidebar.number_input("VPVR 가로 bin 수", 20, 200, st.session_state.get("VPVR_BINS", 64), 1, key="VPVR_BINS")
+        # 세션에 저장(디버그 탭 기본값이 이 값을 사용)
+        st.session_state["VPVR_BINS"] = int(VPVR_BINS)
 
         st.sidebar.header("⚙️ 실행 설정")
         slippage_pct = st.sidebar.number_input("슬리피지(%)", 0.0, 5.0, st.session_state.get("slippage_pct", 0.1), 0.1, key="slippage_pct")
@@ -444,7 +446,7 @@ if uploaded:
                                 use_vwma=use_vwma,
                                 vwma_len=int(VWMA_L),
                                 use_vpvr=use_vpvr,
-                                vpvr_bins=int(VPVR_BINS),
+                                vpvr_bins=int(st.session_state["VPVR_BINS"]),  # 동기화된 값 사용
                             )
 
                         st.subheader("📊 결과 요약")
@@ -491,32 +493,36 @@ if uploaded:
         if "Volume" not in data.columns:
             st.error("VPVR을 계산하려면 CSV에 'volume' 컬럼이 필요합니다.")
         else:
-            # 최종일 선택
+            # 디버그 bins를 사이드바 값으로 동기화(기본값)
+            dbg_bins_default = int(st.session_state.get("VPVR_BINS", 64))
             min_d = data.index[0].date()
             max_d = data.index[-1].date()
-            default_end = max_d
-            end_date = st.date_input("최종일 선택", value=default_end, min_value=min_d, max_value=max_d)
+            end_date = st.date_input("최종일 선택", value=max_d, min_value=min_d, max_value=max_d)
 
-            bins = st.number_input("VPVR bins (가격 구간 수: Number of Rows)", 20, 200, 64, 1)
+            bins = st.number_input(
+                "VPVR bins (가격 구간 수: Number of Rows)",
+                20, 200, dbg_bins_default, 1
+            )
+            # 디버그에서 바꾼 값도 세션에 반영 → 사이드바와 동기화
+            st.session_state["VPVR_BINS"] = int(bins)
+
             run_dbg = st.button("🧮 선택한 최종일 기준, 마지막 103봉으로 VPVR 계산")
 
             if run_dbg:
                 end_ts = pd.Timestamp(end_date)
-                # 최종일(이하 최근접) 위치
-                end_pos = data.index.get_indexer([end_ts], method="pad")[0]
+                all_idx = data.index
+                # 최종일 이하에서 가장 가까운 인덱스
+                end_pos = all_idx.get_indexer([end_ts], method="pad")[0]
                 if end_pos == -1:
                     st.error("선택한 최종일 이전 데이터가 없습니다.")
                     st.stop()
-
-                # 103봉 확보(최종 포함 → 102칸 뒤로)
                 if end_pos < 102:
                     st.error("최종일 기준으로 103봉을 구성할 만큼의 과거 데이터가 부족합니다.")
                     st.stop()
 
-                start_pos = end_pos - 102  # ★ 103봉
+                start_pos = end_pos - 102  # 103봉
                 win_df = data.iloc[start_pos:end_pos+1].copy()
 
-                # 고정 103봉으로 DVAL/DVAH 계산
                 c_win = pd.to_numeric(win_df["Close"], errors="coerce").astype(float).values
                 v_win = pd.to_numeric(win_df["Volume"], errors="coerce").astype(float).values
                 if np.any(np.isnan(c_win)) or np.any(np.isnan(v_win)):
@@ -563,7 +569,6 @@ if uploaded:
                 buy_days  = win_df.index[(~long_shift) & (long_sig)].strftime("%Y-%m-%d").tolist()
                 sell_days = win_df.index[( long_shift) & (~long_sig)].strftime("%Y-%m-%d").tolist()
 
-                # 결과 출력: 날짜만
                 st.success(
                     f"윈도우 기간(마지막 103봉): **{win_df.index[0].date()} ~ {win_df.index[-1].date()}** "
                     f"(최종일: {end_ts.date()}, bins={int(bins)})"
@@ -571,22 +576,12 @@ if uploaded:
                 c1, c2 = st.columns(2)
                 with c1:
                     st.subheader("🟢 매수 발생일")
-                    if buy_days:
-                        st.write("\n".join(buy_days))
-                    else:
-                        st.write("없음")
+                    st.write("\n".join(buy_days) if buy_days else "없음")
                 with c2:
                     st.subheader("🔴 매도 발생일")
-                    if sell_days:
-                        st.write("\n".join(sell_days))
-                    else:
-                        st.write("없음")
+                    st.write("\n".join(sell_days) if sell_days else "없음")
 
-                # 다운로드: 매수/매도 발생일 CSV
-                out_df = pd.DataFrame({
-                    "매수일": pd.Series(buy_days),
-                    "매도일": pd.Series(sell_days)
-                })
+                out_df = pd.DataFrame({"매수일": pd.Series(buy_days), "매도일": pd.Series(sell_days)})
                 st.download_button(
                     "💾 매수/매도 발생일 다운로드",
                     data=out_df.to_csv(index=False).encode("utf-8-sig"),
