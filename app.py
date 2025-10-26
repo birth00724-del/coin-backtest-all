@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import json
 
 st.set_page_config(page_title="TV-Style Supertrend Backtester (Preset Save/Load)", layout="wide")
 st.title("📈 Supertrend (TradingView 호환) — 3중 결합 / KST 기준 / 프리셋 저장·불러오기")
@@ -40,12 +41,20 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
 
     final_upper.iloc[0] = basic_upper.iloc[0]
     final_lower.iloc[0] = basic_lower.iloc[0]
-    dir_long.iloc[0]    = True
+    dir_long.iloc[0]    = True  # 시작값 임의
 
     for i in range(1, len(d)):
-        final_upper.iloc[i] = basic_upper.iloc[i] if (c.iloc[i-1] > final_upper.iloc[i-1]) else min(basic_upper.iloc[i], final_upper.iloc[i-1])
-        final_lower.iloc[i] = basic_lower.iloc[i] if (c.iloc[i-1] < final_lower.iloc[i-1]) else max(basic_lower.iloc[i], final_lower.iloc[i-1])
+        # 계단식(보수적 유지)
+        final_upper.iloc[i] = (
+            basic_upper.iloc[i] if (c.iloc[i-1] > final_upper.iloc[i-1])
+            else min(basic_upper.iloc[i], final_upper.iloc[i-1])
+        )
+        final_lower.iloc[i] = (
+            basic_lower.iloc[i] if (c.iloc[i-1] < final_lower.iloc[i-1])
+            else max(basic_lower.iloc[i], final_lower.iloc[i-1])
+        )
 
+        # 이전 final line 기준 교차 판정
         prev_line = final_lower.iloc[i-1] if dir_long.iloc[i-1] else final_upper.iloc[i-1]
         if c.iloc[i] > prev_line:
             dir_long.iloc[i] = True
@@ -66,14 +75,14 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
 #    - 매수: 3개 모두 상승(True)
 #    - 매도: 1개라도 하락(False)
 #    - 신호는 당일 종가에서 확정
-#    - 체결: 옵션 (당일 종가 / 다음날 시가 / 다음날 종가)
+#    - 체결: 선택형 (당일 종가 / 다음날 시가 / 다음날 종가)
 # =========================================================
 def execute_backtest(data, st_cfgs, fill_policy: str, slippage: float, initial_capital: float):
     st_frames = [supertrend_tv(data, int(L), float(M)) for (L, M) in st_cfgs]
     trends = pd.concat([f["ST_trend"] for f in st_frames], axis=1)
     trends.columns = [f"ST{i+1}" for i in range(3)]
 
-    # 고정된 조건
+    # 조건 고정
     buy_sig  = (trends.sum(axis=1) == 3)      # 3개 모두 True
     sell_sig = (trends.sum(axis=1) < 3)       # 1개라도 False
 
@@ -163,7 +172,7 @@ def execute_backtest(data, st_cfgs, fill_policy: str, slippage: float, initial_c
 
 # =========================================================
 # 3) CSV 업로드 (업비트: date_kst/date_utc + o/h/l/c)
-#    └ 차트와 맞추려면 KST(date_kst) 추천
+#    └ 차트와 맞추려면 KST(date_kst) 권장
 # =========================================================
 uploaded = st.file_uploader("업비트 CSV 업로드 (date_kst 또는 date_utc / open / high / low / close)", type=["csv"])
 
@@ -206,13 +215,11 @@ if uploaded:
     st.success(f"✅ 로드 완료: {data.index.min().date()} ~ {data.index.max().date()} (행 {len(data):,}) — 기준: {tz_col}")
 
     # =====================================================
-    # 4) 사이드바 (조건 고정) + 프리셋: 저장/불러오기 전용
+    # 4) 사이드바(조건 고정) + 프리셋 저장/불러오기(안전 클램프)
     # =====================================================
-    st.sidebar.header("⚙️ 지표/실행 설정 (조건은 고정)")
-    # 위젯(조건은 고정이라 표시만): 3개 모두 매수 진입 / 1개라도 매도면 청산
-    st.sidebar.caption("매수·매도 조건은 고정: 3개 모두 매수 → 진입, 1개라도 매도 → 청산")
+    st.sidebar.header("⚙️ 지표/실행 설정 (조건은 고정: 3개 모두 매수 진입 / 1개라도 매도 청산)")
 
-    # 위젯 키 지정 (프리셋 주입용)
+    # 위젯 키(프리셋 주입용)
     ST1_L = st.sidebar.number_input("ST1 기간", 5, 200, 10, 1, key="ST1_L")
     ST1_M = st.sidebar.number_input("ST1 배수", 0.5, 10.0, 3.0, 0.1, key="ST1_M")
     ST2_L = st.sidebar.number_input("ST2 기간", 5, 200, 20, 1, key="ST2_L")
@@ -226,55 +233,84 @@ if uploaded:
 
     slippage = st.session_state["slippage_pct"] / 100.0
 
-    # ====== (교체) 프리셋 불러오기/적용 버튼 처리 ======
-if apply_btn and sel != "(선택)":
-    p = st.session_state["presets"][sel]
+    # ----- 프리셋 저장/불러오기 -----
+    if "presets" not in st.session_state:
+        st.session_state["presets"] = {}
 
-    # 위젯 제약 정의
-    FILL_OPTIONS = ["당일 종가", "다음날 시가", "다음날 종가"]
+    def current_params():
+        return {
+            "ST1_L": int(st.session_state["ST1_L"]),
+            "ST1_M": float(st.session_state["ST1_M"]),
+            "ST2_L": int(st.session_state["ST2_L"]),
+            "ST2_M": float(st.session_state["ST2_M"]),
+            "ST3_L": int(st.session_state["ST3_L"]),
+            "ST3_M": float(st.session_state["ST3_M"]),
+            "slippage_pct": float(st.session_state["slippage_pct"]),
+            "init_cap": float(st.session_state["init_cap"]),
+            "fill_policy": st.session_state["fill_policy"],
+        }
 
-    def clamp_int(v, lo, hi):
-        try:
-            v = int(round(float(v)))
-        except Exception:
-            v = lo
-        return max(lo, min(hi, v))
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧩 프리셋 (저장/불러오기)")
 
-    def clamp_float(v, lo, hi):
-        try:
-            v = float(v)
-        except Exception:
-            v = lo
-        # 경계 내로
-        if np.isnan(v) or np.isinf(v):
-            v = lo
-        return max(lo, min(hi, v))
+    c1, c2 = st.sidebar.columns([2,1])
+    preset_name = c1.text_input("프리셋 이름", placeholder="예: TV_10-20-30", key="preset_name")
+    save_btn    = c2.button("저장", use_container_width=True)
 
-    # 1) 기간(정수, [5,200])
-    st.session_state["ST1_L"] = clamp_int(p.get("ST1_L", 10), 5, 200)
-    st.session_state["ST2_L"] = clamp_int(p.get("ST2_L", 20), 5, 200)
-    st.session_state["ST3_L"] = clamp_int(p.get("ST3_L", 30), 5, 200)
+    if save_btn and preset_name.strip():
+        st.session_state["presets"][preset_name.strip()] = current_params()
+        st.sidebar.success(f"저장됨: {preset_name.strip()}")
 
-    # 2) 배수(실수, [0.5,10.0])
-    st.session_state["ST1_M"] = clamp_float(p.get("ST1_M", 3.0), 0.5, 10.0)
-    st.session_state["ST2_M"] = clamp_float(p.get("ST2_M", 4.0), 0.5, 10.0)
-    st.session_state["ST3_M"] = clamp_float(p.get("ST3_M", 5.0), 0.5, 10.0)
+    opt_keys = ["(선택)"] + list(st.session_state["presets"].keys())
+    sel = st.sidebar.selectbox("프리셋 불러오기", options=opt_keys, index=0, key="preset_select")
+    apply_btn = st.sidebar.button("불러오기/적용", use_container_width=True)
 
-    # 3) 슬리피지%(실수, [0,5])
-    st.session_state["slippage_pct"] = clamp_float(p.get("slippage_pct", 0.1), 0.0, 5.0)
+    # ===== (중요) 안전 클램프 + 타입 정합 적용 =====
+    if apply_btn and sel != "(선택)":
+        p = st.session_state["presets"][sel]
 
-    # 4) 초기자산(실수, [1, 1_000_000])
-    st.session_state["init_cap"] = clamp_float(p.get("init_cap", 100.0), 1.0, 1_000_000.0)
+        FILL_OPTIONS = ["당일 종가", "다음날 시가", "다음날 종가"]
 
-    # 5) 체결시점(라디오 옵션 강제)
-    fp = p.get("fill_policy", "다음날 시가")
-    if fp not in FILL_OPTIONS:
-        fp = "다음날 시가"
-    st.session_state["fill_policy"] = fp
+        def clamp_int(v, lo, hi):
+            try:
+                v = int(round(float(v)))
+            except Exception:
+                v = lo
+            return max(lo, min(hi, v))
 
-    st.sidebar.success(f"적용됨: {sel}")
-    st.rerun()
+        def clamp_float(v, lo, hi):
+            try:
+                v = float(v)
+            except Exception:
+                v = lo
+            if np.isnan(v) or np.isinf(v):
+                v = lo
+            return max(lo, min(hi, v))
 
+        # 기간(정수, [5,200])
+        st.session_state["ST1_L"] = clamp_int(p.get("ST1_L", 10), 5, 200)
+        st.session_state["ST2_L"] = clamp_int(p.get("ST2_L", 20), 5, 200)
+        st.session_state["ST3_L"] = clamp_int(p.get("ST3_L", 30), 5, 200)
+
+        # 배수(실수, [0.5,10.0])
+        st.session_state["ST1_M"] = clamp_float(p.get("ST1_M", 3.0), 0.5, 10.0)
+        st.session_state["ST2_M"] = clamp_float(p.get("ST2_M", 4.0), 0.5, 10.0)
+        st.session_state["ST3_M"] = clamp_float(p.get("ST3_M", 5.0), 0.5, 10.0)
+
+        # 슬리피지%(실수, [0,5])
+        st.session_state["slippage_pct"] = clamp_float(p.get("slippage_pct", 0.1), 0.0, 5.0)
+
+        # 초기자산(실수, [1, 1_000_000])
+        st.session_state["init_cap"] = clamp_float(p.get("init_cap", 100.0), 1.0, 1_000_000.0)
+
+        # 체결시점(라디오 옵션 강제)
+        fp = p.get("fill_policy", "다음날 시가")
+        if fp not in FILL_OPTIONS:
+            fp = "다음날 시가"
+        st.session_state["fill_policy"] = fp
+
+        st.sidebar.success(f"적용됨: {sel}")
+        st.rerun()
 
     # ================= 실행 =================
     max_len = max(int(ST1_L), int(ST2_L), int(ST3_L))
