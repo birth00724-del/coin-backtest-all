@@ -79,7 +79,7 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
 
     final_upper.iloc[0] = basic_upper.iloc[0]
     final_lower.iloc[0] = basic_lower.iloc[0]
-    dir_long.iloc[0]    = True
+    dir_long.iloc[0]    = True  # 시작값 임의
 
     for i in range(1, len(d)):
         final_upper.iloc[i] = (
@@ -517,18 +517,33 @@ if uploaded:
                 dbg["Close>DVAH?"] = dbg["Close"] > dbg["DVAH_102"]
                 st.dataframe(dbg.tail(150))
 
-                # 특정 날짜 선택 → 해당 날짜의 윈도우 범위 안내
-                sel_date = st.selectbox("윈도우 확인할 날짜 선택 (DVA가 계산된 날짜만)", options=list(dbg.dropna().index.strftime("%Y-%m-%d")), index=len(dbg.dropna())-1 if dbg.dropna().shape[0] else 0)
-                if sel_date:
-                    sel_idx = pd.to_datetime(sel_date)
-                    # compute_vpvr_dva 기준: 해당 날짜 **포함한** 102일 윈도우
+                # ✅ 날짜 선택: 실제 Timestamp를 옵션으로 사용 (KeyError 방지)
+                valid_mask = dval_s.notna() & dvah_s.notna()
+                valid_idx = data.index[valid_mask]
+                if len(valid_idx) == 0:
+                    st.warning("DVAL/DVAH가 계산된 날짜가 없습니다(윈도우 부족).")
+                else:
+                    selected_ts = st.selectbox(
+                        "윈도우 확인할 날짜 선택 (DVA가 계산된 날짜만)",
+                        options=list(valid_idx),
+                        index=len(valid_idx) - 1,
+                        format_func=lambda x: x.strftime("%Y-%m-%d")
+                    )
                     all_idx = data.index
-                    end_pos = all_idx.get_loc(sel_idx)
-                    if isinstance(end_pos, (np.ndarray, list)):
-                        end_pos = end_pos[0]
+                    try:
+                        end_pos = all_idx.get_loc(selected_ts)
+                        if isinstance(end_pos, (np.ndarray, list)):
+                            end_pos = int(end_pos[0])
+                    except KeyError:
+                        nearest = all_idx.get_indexer([selected_ts], method="nearest")[0]
+                        end_pos = int(nearest)
+
                     if end_pos >= 101:
                         start_pos = end_pos - 101
-                        st.info(f"해당 날짜의 102일 윈도우: **{all_idx[start_pos].date()} ~ {all_idx[end_pos].date()}**")
+                        st.info(
+                            f"해당 날짜의 102일 윈도우: "
+                            f"**{all_idx[start_pos].date()} ~ {all_idx[end_pos].date()}**"
+                        )
                     else:
                         st.warning("해당 날짜에서는 102일 윈도우가 아직 완성되지 않았습니다.")
 
