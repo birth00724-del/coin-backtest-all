@@ -4,11 +4,11 @@ import numpy as np
 import plotly.graph_objects as go
 import json
 
-st.set_page_config(page_title="TV-Style Supertrend Backtester (Preset Save/Load)", layout="wide")
-st.title("📈 Supertrend (TradingView 호환) — 3중 결합 / KST 기준 / 프리셋 저장·불러오기")
+st.set_page_config(page_title="TV-Style Supertrend + VWMA Filter Backtester", layout="wide")
+st.title("📈 Supertrend(TradingView) 3중 결합 + VWMA 필터 — KST 기준 / 프리셋 저장·불러오기")
 
 # =========================================================
-# 0) 유틸: 안전 클램프
+# 0) 유틸: 안전 클램프 / 프리셋 보정
 # =========================================================
 def clamp_int(v, lo, hi):
     try:
@@ -29,14 +29,23 @@ def clamp_float(v, lo, hi):
 FILL_OPTIONS = ["당일 종가", "다음날 시가", "다음날 종가"]
 
 def sanitize_preset(p):
-    # 위젯 제약 범위에 맞춰 값 보정
     return {
+        # 전략 선택
+        "use_st": bool(p.get("use_st", True)),
+        "use_vwma": bool(p.get("use_vwma", False)),
+
+        # ST 파라미터
         "ST1_L": clamp_int(p.get("ST1_L", 10), 5, 200),
         "ST1_M": clamp_float(p.get("ST1_M", 3.0), 0.5, 10.0),
         "ST2_L": clamp_int(p.get("ST2_L", 20), 5, 200),
         "ST2_M": clamp_float(p.get("ST2_M", 4.0), 0.5, 10.0),
         "ST3_L": clamp_int(p.get("ST3_L", 30), 5, 200),
         "ST3_M": clamp_float(p.get("ST3_M", 5.0), 0.5, 10.0),
+
+        # VWMA 파라미터
+        "VWMA_L": clamp_int(p.get("VWMA_L", 20), 2, 300),
+
+        # 실행 설정
         "slippage_pct": clamp_float(p.get("slippage_pct", 0.1), 0.0, 5.0),
         "init_cap": clamp_float(p.get("init_cap", 100.0), 1.0, 1_000_000.0),
         "fill_policy": p.get("fill_policy", "다음날 시가") if p.get("fill_policy", "다음날 시가") in FILL_OPTIONS else "다음날 시가",
@@ -106,21 +115,53 @@ def supertrend_tv(df: pd.DataFrame, length: int, multiplier: float) -> pd.DataFr
     return out
 
 # =========================================================
-# 3) 백테스트 (조건 고정)
-#    - 매수: 3개 모두 상승(True)
-#    - 매도: 1개라도 하락(False)
-#    - 신호는 당일 종가에서 확정
+# 3) VWMA (거래량가중이동평균)
+#     VWMA_t = sum(Close*Volume, w) / sum(Volume, w)
+# =========================================================
+def compute_vwma(df: pd.DataFrame, window: int) -> pd.Series:
+    if "Volume" not in df.columns:
+        return pd.Series(index=df.index, dtype=float) * np.nan
+    v = pd.to_numeric(df["Volume"], errors="coerce")
+    c = pd.to_numeric(df["Close"], errors="coerce")
+    num = (c * v).rolling(window, min_periods=window).sum()
+    den = v.rolling(window, min_periods=window).sum()
+    vwma = num / den
+    return vwma
+
+# =========================================================
+# 4) 백테스트 (조건 고정 + 선택적 VWMA 필터)
+#    - 매수: ST 3개 모두 상승(True)
+#            + (두 전략 모두 선택된 경우) Close > VWMA(window)
+#    - 매도: ST 3개 중 1개라도 하락(False)  ※ VWMA는 매도에 관여하지 않음
 #    - 체결: 선택형 (당일 종가 / 다음날 시가 / 다음날 종가)
 # =========================================================
-def execute_backtest(data, st_cfgs, fill_policy: str, slippage: float, initial_capital: float):
+def execute_backtest(
+    data: pd.DataFrame,
+    st_cfgs,              # [(L1,M1),(L2,M2),(L3,M3)]
+    fill_policy: str,
+    slippage: float,
+    initial_capital: float,
+    use_vwma: bool = False,
+    vwma_len: int = 20
+):
+    # ST 3개
     st_frames = [supertrend_tv(data, int(L), float(M)) for (L, M) in st_cfgs]
     trends = pd.concat([f["ST_trend"] for f in st_frames], axis=1)
     trends.columns = [f"ST{i+1}" for i in range(3)]
+    base_buy  = (trends.sum(axis=1) == 3)      # 3개 모두 True
+    base_sell = (trends.sum(axis=1) < 3)       # 1개라도 False
 
-    # 조건 고정
-    buy_sig  = (trends.sum(axis=1) == 3)      # 3개 모두 True
-    sell_sig = (trends.sum(axis=1) < 3)       # 1개라도 False
+    # VWMA 필터 (선택됨 & Volume 존재 시에만 적용)
+    if use_vwma:
+        vwma = compute_vwma(data, int(vwma_len))
+        vwma_ok = data["Close"] > vwma
+        buy_sig = base_buy & vwma_ok
+    else:
+        buy_sig = base_buy
 
+    sell_sig = base_sell  # 매도는 ST 조건 그대로
+
+    # 체결 타이밍/가격
     if fill_policy == "당일 종가":
         buy_exec  = buy_sig.copy()
         sell_exec = sell_sig.copy()
@@ -137,6 +178,7 @@ def execute_backtest(data, st_cfgs, fill_policy: str, slippage: float, initial_c
         buy_px_s  = data["Close"] * (1 + slippage)
         sell_px_s = data["Close"] * (1 - slippage)
 
+    # 시뮬레이션
     position = 0.0
     capital  = float(initial_capital)
     entry_px, entry_ts = None, None
@@ -203,13 +245,12 @@ def execute_backtest(data, st_cfgs, fill_policy: str, slippage: float, initial_c
     else:
         cagr = mdd = sharpe = np.nan
 
-    return equity_s, pd.DataFrame(trades), cagr, mdd, sharpe, st_frames
+    return equity_s, pd.DataFrame(trades), cagr, mdd, sharpe, st_frames, (vwma if use_vwma else None)
 
 # =========================================================
-# 4) CSV 업로드 (업비트: date_kst/date_utc + o/h/l/c)
-#    └ 차트와 맞추려면 KST(date_kst) 권장
+# 5) CSV 업로드 (업비트: date_kst/date_utc + o/h/l/c [+ volume])
 # =========================================================
-uploaded = st.file_uploader("업비트 CSV 업로드 (date_kst 또는 date_utc / open / high / low / close)", type=["csv"])
+uploaded = st.file_uploader("업비트 CSV 업로드 (date_kst 또는 date_utc / open / high / low / close / [volume])", type=["csv"])
 
 if uploaded:
     raw = pd.read_csv(uploaded)
@@ -239,20 +280,23 @@ if uploaded:
         st.error(f"CSV에 필요한 컬럼이 없습니다: {', '.join(missing)}")
         st.stop()
 
-    data = data.rename(columns={
+    rename_map = {
         cols_lower["open"]: "Open",
         cols_lower["high"]: "High",
         cols_lower["low"]:  "Low",
         cols_lower["close"]: "Close"
-    })
-    data = data[["Open", "High", "Low", "Close"]].dropna()
+    }
+    if "volume" in cols_lower:
+        rename_map[cols_lower["volume"]] = "Volume"
 
-    st.success(f"✅ 로드 완료: {data.index.min().date()} ~ {data.index.max().date()} (행 {len(data):,}) — 기준: {tz_col}")
+    data = data.rename(columns=rename_map)
+    keep_cols = ["Open", "High", "Low", "Close"] + (["Volume"] if "Volume" in data.columns else [])
+    data = data[keep_cols].dropna(subset=["Open", "High", "Low", "Close"])
+
+    st.success(f"✅ 로드 완료: {data.index.min().date()} ~ {data.index.max().date()} (행 {len(data):,}) — 기준: {tz_col} — 컬럼: {', '.join(keep_cols)}")
 
     # =====================================================
-    # 5) 프리셋: 저장/불러오기(안전), 적용 타이밍 개선
-    #     - 불러오기 클릭 시 _pending_preset에 담고 rerun
-    #     - 다음 런에서 위젯 생성 전에 session_state에 주입
+    # 6) 프리셋: 저장/불러오기(안전), 적용 타이밍 개선
     # =====================================================
     if "presets" not in st.session_state:
         st.session_state["presets"] = {}
@@ -260,13 +304,19 @@ if uploaded:
     # ▶▶ 적용 대기 프리셋이 있으면 먼저 주입 (위젯 렌더 전에)
     if "_pending_preset" in st.session_state:
         safe = sanitize_preset(st.session_state["_pending_preset"])
-        # 위젯 키들에 값 주입
+        # 전략 선택
+        st.session_state["use_st"] = safe["use_st"]
+        st.session_state["use_vwma"] = safe["use_vwma"]
+        # ST
         st.session_state["ST1_L"] = safe["ST1_L"]
         st.session_state["ST1_M"] = safe["ST1_M"]
         st.session_state["ST2_L"] = safe["ST2_L"]
         st.session_state["ST2_M"] = safe["ST2_M"]
         st.session_state["ST3_L"] = safe["ST3_L"]
         st.session_state["ST3_M"] = safe["ST3_M"]
+        # VWMA
+        st.session_state["VWMA_L"] = safe["VWMA_L"]
+        # 실행설정
         st.session_state["slippage_pct"] = safe["slippage_pct"]
         st.session_state["init_cap"] = safe["init_cap"]
         st.session_state["fill_policy"] = safe["fill_policy"]
@@ -274,9 +324,13 @@ if uploaded:
         del st.session_state["_pending_preset"]
 
     # =====================================================
-    # 6) 사이드바(조건 고정) + 위젯 정의
+    # 7) 사이드바 — 전략 선택 & 파라미터 (프리셋 저장/불러오기 포함)
     # =====================================================
-    st.sidebar.header("⚙️ 지표/실행 설정 (조건 고정: 3개 모두 매수 진입 / 1개라도 매도 청산)")
+    st.sidebar.header("🧠 전략 선택")
+    use_st   = st.sidebar.checkbox("수퍼트렌드 x3 사용", value=st.session_state.get("use_st", True), key="use_st")
+    use_vwma = st.sidebar.checkbox("VWMA 필터 사용 (매수 시 Close > VWMA)", value=st.session_state.get("use_vwma", False), key="use_vwma")
+
+    st.sidebar.header("⚙️ 수퍼트렌드 파라미터")
     ST1_L = st.sidebar.number_input("ST1 기간", 5, 200, st.session_state.get("ST1_L", 10), 1, key="ST1_L")
     ST1_M = st.sidebar.number_input("ST1 배수", 0.5, 10.0, st.session_state.get("ST1_M", 3.0), 0.1, key="ST1_M")
     ST2_L = st.sidebar.number_input("ST2 기간", 5, 200, st.session_state.get("ST2_L", 20), 1, key="ST2_L")
@@ -284,28 +338,34 @@ if uploaded:
     ST3_L = st.sidebar.number_input("ST3 기간", 5, 200, st.session_state.get("ST3_L", 30), 1, key="ST3_L")
     ST3_M = st.sidebar.number_input("ST3 배수", 0.5, 10.0, st.session_state.get("ST3_M", 5.0), 0.1, key="ST3_M")
 
+    st.sidebar.header("⚙️ VWMA 파라미터")
+    VWMA_L = st.sidebar.number_input("VWMA 기간", 2, 300, st.session_state.get("VWMA_L", 20), 1, key="VWMA_L")
+
+    st.sidebar.header("⚙️ 실행 설정")
     slippage_pct = st.sidebar.number_input("슬리피지(%)", 0.0, 5.0, st.session_state.get("slippage_pct", 0.1), 0.1, key="slippage_pct")
     init_cap     = st.sidebar.number_input("초기자산", 1.0, 1_000_000.0, st.session_state.get("init_cap", 100.0), 1.0, key="init_cap")
     fill_policy  = st.sidebar.radio("체결 시점", FILL_OPTIONS, index=FILL_OPTIONS.index(st.session_state.get("fill_policy", "다음날 시가")), key="fill_policy")
 
     slippage = st.session_state["slippage_pct"] / 100.0
 
-    # ===== 프리셋 저장/불러오기 UI =====
+    # 프리셋 저장/불러오기
     st.sidebar.markdown("---")
     st.sidebar.subheader("🧩 프리셋 (저장/불러오기)")
-
     c1, c2 = st.sidebar.columns([2,1])
-    preset_name = c1.text_input("프리셋 이름", placeholder="예: TV_10-20-30", key="preset_name")
+    preset_name = c1.text_input("프리셋 이름", placeholder="예: STx3_VWMA20", key="preset_name")
     save_btn    = c2.button("저장", use_container_width=True)
 
     def current_params():
         return {
+            "use_st": bool(st.session_state["use_st"]),
+            "use_vwma": bool(st.session_state["use_vwma"]),
             "ST1_L": int(st.session_state["ST1_L"]),
             "ST1_M": float(st.session_state["ST1_M"]),
             "ST2_L": int(st.session_state["ST2_L"]),
             "ST2_M": float(st.session_state["ST2_M"]),
             "ST3_L": int(st.session_state["ST3_L"]),
             "ST3_M": float(st.session_state["ST3_M"]),
+            "VWMA_L": int(st.session_state["VWMA_L"]),
             "slippage_pct": float(st.session_state["slippage_pct"]),
             "init_cap": float(st.session_state["init_cap"]),
             "fill_policy": st.session_state["fill_policy"],
@@ -319,7 +379,6 @@ if uploaded:
     sel = st.sidebar.selectbox("프리셋 불러오기", options=opt_keys, index=0, key="preset_select")
     apply_btn = st.sidebar.button("불러오기/적용", use_container_width=True)
 
-    # ▶▶ 불러오기는 '지금 세팅'이 아니라 '다음 런의 초기값'으로 주입
     if apply_btn and sel != "(선택)":
         p = st.session_state["presets"][sel]
         st.session_state["_pending_preset"] = sanitize_preset(p)
@@ -327,53 +386,66 @@ if uploaded:
         st.rerun()
 
     # ================= 실행 =================
-    max_len = max(int(ST1_L), int(ST2_L), int(ST3_L))
-    if len(data) < max_len + 10:
-        st.warning(f"데이터가 부족합니다. 최소 {max_len + 10}개 행 이상 필요합니다.")
+    if not use_st and use_vwma:
+        st.warning("VWMA 필터만으로는 매수/매도 규칙이 정의되지 않습니다. 수퍼트렌드 x3를 함께 선택하세요.")
     else:
-        if st.button("🚀 백테스트 실행"):
-            with st.spinner("계산 중..."):
-                equity, trades, cagr, mdd, sharpe, st_frames = execute_backtest(
-                    data,
-                    [(ST1_L, ST1_M), (ST2_L, ST2_M), (ST3_L, ST3_M)],
-                    fill_policy=st.session_state["fill_policy"],
-                    slippage=slippage,
-                    initial_capital=float(st.session_state["init_cap"])
-                )
+        # 데이터 길이 가드
+        max_len = max(int(ST1_L), int(ST2_L), int(ST3_L), int(VWMA_L if use_vwma else 2))
+        if len(data) < max_len + 10:
+            st.warning(f"데이터가 부족합니다. 최소 {max_len + 10}개 행 이상 필요합니다.")
+        else:
+            if st.button("🚀 백테스트 실행"):
+                # VWMA 필터 선택했는데 Volume이 없으면 오류 안내
+                if use_vwma and "Volume" not in data.columns:
+                    st.error("VWMA 필터를 사용하려면 CSV에 'volume' 컬럼이 필요합니다.")
+                else:
+                    with st.spinner("계산 중..."):
+                        equity, trades, cagr, mdd, sharpe, st_frames, vwma_s = execute_backtest(
+                            data,
+                            [(ST1_L, ST1_M), (ST2_L, ST2_M), (ST3_L, ST3_M)],
+                            fill_policy=st.session_state["fill_policy"],
+                            slippage=slippage,
+                            initial_capital=float(st.session_state["init_cap"]),
+                            use_vwma=use_vwma,
+                            vwma_len=int(VWMA_L)
+                        )
 
-            # 결과 요약
-            st.subheader("📊 결과 요약")
-            cagr_txt = "데이터 부족" if (pd.isna(cagr) or np.isinf(cagr)) else f"{cagr*100:.2f}%"
-            st.write(f"**CAGR**: {cagr_txt}")
-            st.write(f"**MDD** : {mdd*100:.2f}%")
-            st.write(f"**Sharpe**: {sharpe:.2f}")
-            st.write(f"**거래 횟수**: {len(trades)}")
+                    # 결과 요약
+                    st.subheader("📊 결과 요약")
+                    cagr_txt = "데이터 부족" if (pd.isna(cagr) or np.isinf(cagr)) else f"{cagr*100:.2f}%"
+                    st.write(f"**CAGR**: {cagr_txt}")
+                    st.write(f"**MDD** : {mdd*100:.2f}%")
+                    st.write(f"**Sharpe**: {sharpe:.2f}")
+                    st.write(f"**거래 횟수**: {len(trades)}")
 
-            # 가격 + ST 라인
-            st.subheader("📈 가격 & Supertrend (TV 방식)")
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(
-                x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"],
-                name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350", showlegend=False
-            ))
-            colors = ["#2e7d32", "#8e24aa", "#ef6c00"]
-            for i, stf in enumerate(st_frames):
-                fig.add_trace(go.Scatter(x=data.index, y=stf["Upper"], mode="lines", name=f"ST{i+1} Upper", line=dict(width=1, dash="dot", color=colors[i])))
-                fig.add_trace(go.Scatter(x=data.index, y=stf["Lower"], mode="lines", name=f"ST{i+1} Lower", line=dict(width=1, dash="dot", color=colors[i])))
-                fig.add_trace(go.Scatter(x=data.index, y=stf["ST_line"], mode="lines", name=f"ST{i+1} Line",  line=dict(width=2, color=colors[i])))
-            fig.update_layout(template="plotly_white", xaxis_title=("date_kst" if "date_kst" in cols_lower else "date_utc"), yaxis_title="Price")
-            st.plotly_chart(fig, use_container_width=True)
+                    # 가격 + ST 라인 (+VWMA)
+                    st.subheader("📈 가격 & Supertrend (TV) " + ("+ VWMA" if use_vwma else ""))
+                    fig = go.Figure()
+                    fig.add_trace(go.Candlestick(
+                        x=data.index, open=data["Open"], high=data["High"], low=data["Low"], close=data["Close"],
+                        name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350", showlegend=False
+                    ))
+                    colors = ["#2e7d32", "#8e24aa", "#ef6c00"]
+                    for i, stf in enumerate(st_frames):
+                        fig.add_trace(go.Scatter(x=data.index, y=stf["Upper"], mode="lines", name=f"ST{i+1} Upper", line=dict(width=1, dash="dot", color=colors[i])))
+                        fig.add_trace(go.Scatter(x=data.index, y=stf["Lower"], mode="lines", name=f"ST{i+1} Lower", line=dict(width=1, dash="dot", color=colors[i])))
+                        fig.add_trace(go.Scatter(x=data.index, y=stf["ST_line"], mode="lines", name=f"ST{i+1} Line",  line=dict(width=2, color=colors[i])))
+                    if use_vwma and vwma_s is not None:
+                        fig.add_trace(go.Scatter(x=vwma_s.index, y=vwma_s.values, mode="lines", name=f"VWMA({int(VWMA_L)})", line=dict(width=2, color="#1565c0")))
 
-            # 자산 곡선
-            st.subheader("💰 자산 곡선 (Equity)")
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=equity.index, y=equity.values, mode='lines', name='Equity'))
-            fig2.update_layout(template="plotly_white", xaxis_title=("date_kst" if "date_kst" in cols_lower else "date_utc"), yaxis_title="Equity")
-            st.plotly_chart(fig2, use_container_width=True)
+                    fig.update_layout(template="plotly_white", xaxis_title=("date_kst" if "date_kst" in cols_lower else "date_utc"), yaxis_title="Price")
+                    st.plotly_chart(fig, use_container_width=True)
 
-            # 매매 내역
-            st.subheader("🧾 매매 내역")
-            st.dataframe(trades)
-            if not trades.empty:
-                csv = trades.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("💾 매매 내역 다운로드", data=csv, file_name="trade_log.csv", mime="text/csv")
+                    # 자산 곡선
+                    st.subheader("💰 자산 곡선 (Equity)")
+                    fig2 = go.Figure()
+                    fig2.add_trace(go.Scatter(x=equity.index, y=equity.values, mode='lines', name='Equity'))
+                    fig2.update_layout(template="plotly_white", xaxis_title=("date_kst" if "date_kst" in cols_lower else "date_utc"), yaxis_title="Equity")
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                    # 매매 내역
+                    st.subheader("🧾 매매 내역")
+                    st.dataframe(trades)
+                    if not trades.empty:
+                        csv = trades.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button("💾 매매 내역 다운로드", data=csv, file_name="trade_log.csv", mime="text/csv")
