@@ -3,168 +3,127 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="SuperTrend 백테스터", layout="wide")
-st.title("📈 SuperTrend 3중 조건 백테스터 (업비트 CSV 전체기간)")
+# -------------------------------
+# SuperTrend 계산 함수
+# -------------------------------
+def supertrend(df, period=10, multiplier=3):
+    hl2 = (df['High'] + df['Low']) / 2
+    df['ATR'] = df['High'].combine(df['Low'], np.subtract).abs().rolling(period).mean()
+    df['UpperBand'] = hl2 + (multiplier * df['ATR'])
+    df['LowerBand'] = hl2 - (multiplier * df['ATR'])
 
-# ============================================================
-# 1) 데이터 로드
-# ============================================================
-@st.cache_data
-def load_upbit_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-
-    if "date_kst" in df.columns:
-        df["Date"] = pd.to_datetime(df["date_kst"], errors="coerce")
-    elif "date_utc" in df.columns:
-        df["Date"] = pd.to_datetime(df["date_utc"], errors="coerce")
-    elif "timestamp" in df.columns:
-        df["Date"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
-    else:
-        raise KeyError("CSV에서 날짜 컬럼을 찾지 못했습니다.")
-
-    price_col = "close" if "close" in df.columns else (
-        "trade_price" if "trade_price" in df.columns else None
-    )
-    high_col = "high" if "high" in df.columns else (
-        "candle_high_price" if "candle_high_price" in df.columns else None
-    )
-    low_col = "low" if "low" in df.columns else (
-        "candle_low_price" if "candle_low_price" in df.columns else None
-    )
-    vol_col = "volume" if "volume" in df.columns else (
-        "candle_acc_trade_volume" if "candle_acc_trade_volume" in df.columns else None
-    )
-
-    if None in (price_col, high_col, low_col, vol_col):
-        raise KeyError("CSV에서 필요한 컬럼(close, high, low, volume)을 찾지 못했습니다.")
-
-    df = df.rename(columns={
-        price_col: "Close",
-        high_col: "High",
-        low_col: "Low",
-        vol_col: "Volume"
-    })
-    df = df[["Date", "High", "Low", "Close", "Volume"]].dropna().sort_values("Date").set_index("Date")
+    trend = [True]
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > df['UpperBand'].iloc[i - 1]:
+            trend.append(True)
+        elif df['Close'].iloc[i] < df['LowerBand'].iloc[i - 1]:
+            trend.append(False)
+        else:
+            trend.append(trend[-1])
+            if trend[-1] and df['LowerBand'].iloc[i] < df['LowerBand'].iloc[i - 1]:
+                df.loc[df.index[i], 'LowerBand'] = df['LowerBand'].iloc[i - 1]
+            if not trend[-1] and df['UpperBand'].iloc[i] > df['UpperBand'].iloc[i - 1]:
+                df.loc[df.index[i], 'UpperBand'] = df['UpperBand'].iloc[i - 1]
+    df['Supertrend'] = np.where(trend, df['LowerBand'], df['UpperBand'])
+    df['Direction'] = np.where(df['Close'] >= df['Supertrend'], 1, -1)
     return df
 
-try:
-    data = load_upbit_csv("upbit_krw_btc_daily_all.csv")
-    st.success(f"✅ CSV 로드 성공: {len(data):,}행 (기간: {data.index.min().date()} ~ {data.index.max().date()})")
-except Exception as e:
-    st.error(f"❌ CSV 로드 실패: {e}")
-    st.stop()
+# -------------------------------
+# 백테스트 함수
+# -------------------------------
+def backtest(df, st_params, slippage=0.001, initial_capital=1000000):
+    st1 = supertrend(df.copy(), period=st_params[0][0], multiplier=st_params[0][1])
+    st2 = supertrend(df.copy(), period=st_params[1][0], multiplier=st_params[1][1])
+    st3 = supertrend(df.copy(), period=st_params[2][0], multiplier=st_params[2][1])
 
-# ============================================================
-# 2) 공통 설정
-# ============================================================
-st.sidebar.header("⚙️ 공통 설정")
-initial_capital = st.sidebar.number_input("초기자금", min_value=1.0, value=100.0, step=1.0)
-slippage_pct = st.sidebar.slider("슬리피지(%)", 0.0, 5.0, 3.0, 0.5)
-slippage = slippage_pct / 100.0
+    dir_df = pd.concat([st1['Direction'], st2['Direction'], st3['Direction']], axis=1)
+    dir_df.columns = ['ST1', 'ST2', 'ST3']
 
-# ============================================================
-# 3) SuperTrend 파라미터
-# ============================================================
-st.sidebar.header("🧪 SuperTrend 설정 (3중)")
-super_params = []
-for i in range(1, 4):
-    with st.sidebar.expander(f"SuperTrend {i}", expanded=True):
-        atr_period = st.number_input(f"ATR 기간 {i}", min_value=2, max_value=100, value=10 * i, step=1, key=f"atr_{i}")
-        multiplier = st.number_input(f"Multiplier {i}", min_value=1.0, max_value=10.0, value=1.5 * i, step=0.1, key=f"mult_{i}")
-        super_params.append({"atr_period": int(atr_period), "multiplier": float(multiplier)})
+    combined_signal = np.where(dir_df.sum(axis=1) == 3, 1, np.where(dir_df.sum(axis=1) == -3, -1, 0))
+    df['Signal'] = pd.Series(combined_signal, index=df.index)
 
-# ============================================================
-# 4) SuperTrend 계산 함수
-# ============================================================
-def compute_supertrend(df, atr_period=10, multiplier=3.0):
-    d = df.copy()
-    hl2 = (d["High"] + d["Low"]) / 2
-    d["TR"] = np.maximum.reduce([
-        d["High"] - d["Low"],
-        (d["High"] - d["Close"].shift(1)).abs(),
-        (d["Low"] - d["Close"].shift(1)).abs()
-    ])
-    d["ATR"] = d["TR"].rolling(atr_period).mean()
-    d["upperband"] = hl2 + (multiplier * d["ATR"])
-    d["lowerband"] = hl2 - (multiplier * d["ATR"])
-    d["supertrend"] = np.nan
-    d["trend"] = 1
+    # 매매 기록용 리스트
+    trades = []
+    position = 0
+    entry_price = 0
+    capital = initial_capital
+    equity_curve = []
 
-    for i in range(1, len(d)):
-        prev = i - 1
-        if d["Close"].iloc[i] > d["upperband"].iloc[prev]:
-            d["trend"].iloc[i] = 1
-        elif d["Close"].iloc[i] < d["lowerband"].iloc[prev]:
-            d["trend"].iloc[i] = -1
-        else:
-            d["trend"].iloc[i] = d["trend"].iloc[prev]
-            if d["trend"].iloc[i] == 1:
-                d["lowerband"].iloc[i] = max(d["lowerband"].iloc[i], d["lowerband"].iloc[prev])
-            else:
-                d["upperband"].iloc[i] = min(d["upperband"].iloc[i], d["upperband"].iloc[prev])
+    for i in range(1, len(df)):
+        signal = df['Signal'].iloc[i]
+        close = df['Close'].iloc[i]
 
-        d["supertrend"].iloc[i] = (
-            d["lowerband"].iloc[i] if d["trend"].iloc[i] == 1 else d["upperband"].iloc[i]
-        )
-    return d["trend"]
+        if signal == 1 and position == 0:  # 진입
+            entry_price = close * (1 + slippage)
+            position = 1
+            entry_date = df.index[i]
+        elif signal == -1 and position == 1:  # 청산
+            exit_price = close * (1 - slippage)
+            exit_date = df.index[i]
+            ret = (exit_price - entry_price) / entry_price
+            capital *= (1 + ret)
+            trades.append({
+                '매수일': entry_date.strftime('%Y-%m-%d'),
+                '매수가': round(entry_price, 2),
+                '매도일': exit_date.strftime('%Y-%m-%d'),
+                '매도가': round(exit_price, 2),
+                '슬리피지 반영 수익률(%)': round(ret * 100, 2),
+                '자본 변화(원)': round(capital, 2)
+            })
+            position = 0
+        equity_curve.append(capital)
 
-# ============================================================
-# 5) 세 SuperTrend 결합 시그널
-# ============================================================
-def combined_supertrend(df, params_list):
-    trends = []
-    for p in params_list:
-        trend = compute_supertrend(df, **p)
-        trends.append(trend)
-    combo = np.where((trends[0] == 1) & (trends[1] == 1) & (trends[2] == 1), 1, -1)
-    return pd.Series(combo, index=df.index)
+    df['Equity'] = equity_curve + [capital] * (len(df) - len(equity_curve))
+    df['Equity'] = df['Equity'].ffill()
 
-# ============================================================
-# 6) 백테스트
-# ============================================================
-signal = combined_supertrend(data, super_params)
-returns = signal.shift(1) * data["Close"].pct_change()
-returns -= slippage * np.abs(signal.diff().fillna(0))
-curve = (1 + returns).cumprod() * initial_capital
+    total_return = df['Equity'].iloc[-1] / initial_capital - 1
+    years = (df.index[-1] - df.index[0]).days / 365
+    CAGR = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+    drawdown = (df['Equity'] / df['Equity'].cummax() - 1).min()
+    returns = pd.Series(df['Equity']).pct_change().dropna()
+    sharpe = (returns.mean() / returns.std()) * np.sqrt(252) if not returns.empty else 0
 
-# ============================================================
-# 7) 성과 지표
-# ============================================================
-def metrics(curve):
-    if curve.empty:
-        return 0, 0, 0, 0
-    final = curve.iloc[-1]
-    years = max(len(curve) / 252, 1)
-    cagr = (final / curve.iloc[0]) ** (1 / years) - 1
-    mdd = (curve / curve.cummax() - 1).min()
-    daily = curve.pct_change().dropna()
-    sharpe = (daily.mean() / daily.std()) * np.sqrt(252) if daily.std() != 0 else 0
-    return final, cagr, mdd, sharpe
+    trade_df = pd.DataFrame(trades)
+    return df, trade_df, CAGR, drawdown, sharpe
 
-final, cagr, mdd, sharpe = metrics(curve)
+# -------------------------------
+# Streamlit UI
+# -------------------------------
+st.title("📊 SuperTrend 3중 결합 백테스트")
 
-# ============================================================
-# 8) 시각화
-# ============================================================
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=data.index, y=data["Close"], name="Price", yaxis="y1"))
-fig.add_trace(go.Scatter(x=curve.index, y=curve.values, name="Equity Curve", yaxis="y2"))
+uploaded_file = st.file_uploader("CSV 파일 업로드 (열: Date, Open, High, Low, Close, Volume)", type=['csv'])
+if uploaded_file:
+    data = pd.read_csv(uploaded_file)
+    data['Date'] = pd.to_datetime(data['Date'])
+    data.set_index('Date', inplace=True)
+    data = data.sort_index()
 
-fig.update_layout(
-    title=f"SuperTrend 3중 조건 백테스트 (초기 {initial_capital:,.0f}, 슬리피지 {slippage_pct}%)",
-    yaxis=dict(title="가격", side="left", showgrid=False),
-    yaxis2=dict(title="자산곡선", side="right", overlaying="y", showgrid=False),
-    legend=dict(x=0, y=1.1, orientation="h"),
-    template="plotly_white"
-)
-st.plotly_chart(fig, use_container_width=True)
+    st.sidebar.header("SuperTrend 파라미터 설정")
+    st1 = (st.sidebar.number_input("ST1 Period", 5, 50, 10),
+           st.sidebar.number_input("ST1 Multiplier", 1.0, 10.0, 3.0))
+    st2 = (st.sidebar.number_input("ST2 Period", 5, 50, 15),
+           st.sidebar.number_input("ST2 Multiplier", 1.0, 10.0, 4.0))
+    st3 = (st.sidebar.number_input("ST3 Period", 5, 50, 20),
+           st.sidebar.number_input("ST3 Multiplier", 1.0, 10.0, 5.0))
 
-st.subheader("📊 성과 요약")
-st.write({
-    "최종자산": f"{final:,.2f}",
-    "CAGR": f"{cagr*100:.2f}%",
-    "MDD": f"{mdd*100:.2f}%",
-    "Sharpe": f"{sharpe:.2f}"
-})
+    slippage = st.sidebar.number_input("Slippage (예: 0.001 = 0.1%)", 0.0, 0.01, 0.001)
+    initial_capital = st.sidebar.number_input("초기자금 (원)", 100000, 100000000, 1000000)
 
-st.success("✅ 완료! SuperTrend 3중 조건 백테스트 실행 성공")
+    if st.button("백테스트 실행"):
+        df_result, trade_log, CAGR, MDD, Sharpe = backtest(data, [st1, st2, st3], slippage, initial_capital)
+
+        st.subheader("📈 백테스트 결과 요약")
+        st.write(f"**CAGR:** {CAGR*100:.2f}%")
+        st.write(f"**MDD:** {MDD*100:.2f}%")
+        st.write(f"**Sharpe Ratio:** {Sharpe:.2f}")
+        st.write(f"**총 거래 횟수:** {len(trade_log)}회")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_result.index, y=df_result['Equity'], name='Equity', line=dict(color='blue')))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("📜 매매 내역")
+        st.dataframe(trade_log)
+
+        csv = trade_log.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 매매내역 다운로드 (CSV)", csv, "trade_log.csv", "text/csv")
