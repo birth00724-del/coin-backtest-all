@@ -339,14 +339,14 @@ if uploaded:
     st.success(f"✅ 로드 완료: {data.index.min().date()} ~ {data.index.max().date()} (행 {len(data):,}) — 기준: {tz_col} — 컬럼: {', '.join(keep_cols)}")
 
     # ---------------- Tabs: 백테스트 / VPVR 디버그 ----------------
-    tab1, tab2 = st.tabs(["🧪 전략 백테스트 (103 VPVR)", "🔎 VPVR 디버그(최종일 선택/103봉)"])
+    tab1, tab2 = st.tabs(["🧪 전략 백테스트 (103 VPVR)", "🔎 VPVR 디버그(전체기간 롤링)"])
 
     # ======================= 탭1: 전략 백테스트 =======================
     with tab1:
         if "presets" not in st.session_state:
             st.session_state["presets"] = {}
 
-        # ▶ 프리셋/디버그에서 펜딩한 bins가 있다면, 위젯 생성 전에 주입
+        # ▶ 디버그 탭에서 펜딩한 bins가 있으면, 위젯 생성 전에 주입
         if "_pending_vpvr_bins" in st.session_state:
             st.session_state["VPVR_BINS"] = int(st.session_state["_pending_vpvr_bins"])
             del st.session_state["_pending_vpvr_bins"]
@@ -389,7 +389,7 @@ if uploaded:
             st.session_state.get("VPVR_BINS", 64), 1,
             key="VPVR_BINS"  # 위젯이 세션 키 소유
         )
-        vpvr_bins_val = int(VPVR_BINS)  # 사용 시 이 값 넘김
+        vpvr_bins_val = int(VPVR_BINS)
 
         st.sidebar.header("⚙️ 실행 설정")
         slippage_pct = st.sidebar.number_input("슬리피지(%)", 0.0, 5.0, st.session_state.get("slippage_pct", 0.1), 0.1, key="slippage_pct")
@@ -456,7 +456,7 @@ if uploaded:
                                 use_vwma=use_vwma,
                                 vwma_len=int(VWMA_L),
                                 use_vpvr=use_vpvr,
-                                vpvr_bins=vpvr_bins_val,  # 동기화된 값 사용
+                                vpvr_bins=vpvr_bins_val,
                             )
 
                         st.subheader("📊 결과 요약")
@@ -497,94 +497,40 @@ if uploaded:
                             csv = trades.to_csv(index=False).encode("utf-8-sig")
                             st.download_button("💾 매매 내역 다운로드", data=csv, file_name="trade_log.csv", mime="text/csv")
 
-    # ======================= 탭2: VPVR 디버그 (최종일 선택/103봉) =======================
+    # =================== 탭2: VPVR 디버그 (전체 기간 롤링) ===================
     with tab2:
-        st.markdown("### 🔎 VPVR 단독 디버그 — **최종일을 선택**하고, 그 날짜를 끝으로 한 **마지막 103봉**만 사용")
+        st.markdown("### 🔎 VPVR 롤링 디버그 — **전체 기간**에 대해 매일 103봉 기준으로 DVAL/DVAH 재계산")
         if "Volume" not in data.columns:
             st.error("VPVR을 계산하려면 CSV에 'volume' 컬럼이 필요합니다.")
         else:
             dbg_bins_default = int(st.session_state.get("VPVR_BINS", 64))
-            min_d = data.index[0].date()
-            max_d = data.index[-1].date()
-            end_date = st.date_input("최종일 선택", value=max_d, min_value=min_d, max_value=max_d)
-
             bins = st.number_input(
                 "VPVR bins (가격 구간 수: Number of Rows)",
                 20, 200, dbg_bins_default, 1
             )
 
-            # ← 디버그에서 사이드바로 동기화 (다음 런에서 적용)
+            # 사이드바로 동기화 (다음 런에서 적용)
             apply_dbg_bins = st.button("⬅️ 이 bins 값을 사이드바에도 적용")
             if apply_dbg_bins:
                 st.session_state["_pending_vpvr_bins"] = int(bins)
                 st.rerun()
 
-            run_dbg = st.button("🧮 선택한 최종일 기준, 마지막 103봉으로 VPVR 계산")
-
+            run_dbg = st.button("🧮 전체 기간 롤링 VPVR 계산 (103봉)")
             if run_dbg:
-                end_ts = pd.Timestamp(end_date)
-                all_idx = data.index
-                end_pos = all_idx.get_indexer([end_ts], method="pad")[0]
-                if end_pos == -1:
-                    st.error("선택한 최종일 이전 데이터가 없습니다.")
-                    st.stop()
-                if end_pos < 102:
-                    st.error("최종일 기준으로 103봉을 구성할 만큼의 과거 데이터가 부족합니다.")
-                    st.stop()
+                with st.spinner("VPVR(103봉 롤링) 계산 중..."):
+                    dval_s, dvah_s = compute_vpvr_dva(data, window=103, bins=int(bins))
 
-                start_pos = end_pos - 102  # 103봉
-                win_df = data.iloc[start_pos:end_pos+1].copy()
+                # Long 판단 (해당 일의 dvah가 존재하는 구간부터)
+                close = data["Close"].astype(float)
+                long_sig = (close > dvah_s)
+                long_sig = long_sig & dvah_s.notna()
 
-                c_win = pd.to_numeric(win_df["Close"], errors="coerce").astype(float).values
-                v_win = pd.to_numeric(win_df["Volume"], errors="coerce").astype(float).values
-                if np.any(np.isnan(c_win)) or np.any(np.isnan(v_win)):
-                    st.error("윈도우 내에 NaN 가격/거래량이 있습니다. CSV를 확인하세요.")
-                    st.stop()
-
-                lo = float(np.min(c_win)); hi = float(np.max(c_win))
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    st.error("윈도우 가격 범위를 계산할 수 없습니다.")
-                    st.stop()
-
-                edges = np.linspace(lo, hi, int(bins) + 1)
-                bin_idx = np.clip(np.digitize(c_win, edges) - 1, 0, int(bins) - 1)
-                vol_hist = np.bincount(bin_idx, weights=v_win, minlength=int(bins)).astype(float)
-
-                total = float(vol_hist.sum())
-                if total <= 0:
-                    st.error("윈도우에서 거래량 합이 0입니다.")
-                    st.stop()
-
-                poc = int(np.argmax(vol_hist))
-                target = 0.7 * total
-                cum = vol_hist[poc]
-                left = poc - 1; right = poc + 1
-                min_i = poc; max_i = poc
-
-                while cum < target and (left >= 0 or right < int(bins)):
-                    lv = vol_hist[left] if left >= 0 else -1.0
-                    rv = vol_hist[right] if right < int(bins) else -1.0
-                    if rv > lv:
-                        cum += max(rv, 0.0); max_i = right; right += 1
-                    else:
-                        cum += max(lv, 0.0); min_i = left; left -= 1
-
-                DVAL_const = float(edges[min_i])
-                DVAH_const = float(edges[max_i + 1])
-
-                # 신호: Close > DVAH_const → Long, 아니면 Flat
-                close_win = win_df["Close"].astype(float)
-                long_sig = close_win > DVAH_const
-
-                # 전환점(발생일)만 추출
+                # 전환점(매수/매도 발생일)
                 long_shift = long_sig.shift(1, fill_value=False)
-                buy_days  = win_df.index[(~long_shift) & (long_sig)].strftime("%Y-%m-%d").tolist()
-                sell_days = win_df.index[( long_shift) & (~long_sig)].strftime("%Y-%m-%d").tolist()
+                buy_days  = data.index[(~long_shift) & ( long_sig)].strftime("%Y-%m-%d").tolist()
+                sell_days = data.index[( long_shift) & (~long_sig)].strftime("%Y-%m-%d").tolist()
 
-                st.success(
-                    f"윈도우 기간(마지막 103봉): **{win_df.index[0].date()} ~ {win_df.index[-1].date()}** "
-                    f"(최종일: {end_ts.date()}, bins={int(bins)})"
-                )
+                st.success(f"계산 완료 (bins={int(bins)}, 윈도우=103봉). 매수 {len(buy_days)}건 / 매도 {len(sell_days)}건")
                 c1, c2 = st.columns(2)
                 with c1:
                     st.subheader("🟢 매수 발생일")
@@ -593,10 +539,20 @@ if uploaded:
                     st.subheader("🔴 매도 발생일")
                     st.write("\n".join(sell_days) if sell_days else "없음")
 
+                # 라인 확인용 차트
+                st.subheader("📈 Close vs DVAL/DVAH (103봉 롤링)")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=data.index, y=close, mode="lines", name="Close"))
+                fig.add_trace(go.Scatter(x=dval_s.index, y=dval_s.values, mode="lines", name="DVAL(103)", line=dict(width=1, dash="dash")))
+                fig.add_trace(go.Scatter(x=dvah_s.index, y=dvah_s.values, mode="lines", name="DVAH(103)", line=dict(width=2)))
+                fig.update_layout(template="plotly_white", xaxis_title=("date_kst" if "date_kst" in cols_lower else "date_utc"), yaxis_title="Price")
+                st.plotly_chart(fig, use_container_width=True)
+
+                # 다운로드
                 out_df = pd.DataFrame({"매수일": pd.Series(buy_days), "매도일": pd.Series(sell_days)})
                 st.download_button(
                     "💾 매수/매도 발생일 다운로드",
                     data=out_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"vpvr_dates_END_{end_ts.date()}_last103_bins{int(bins)}.csv",
+                    file_name=f"vpvr_rolling103_bins{int(bins)}.csv",
                     mime="text/csv"
                 )
