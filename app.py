@@ -226,44 +226,55 @@ if uploaded:
 
     slippage = st.session_state["slippage_pct"] / 100.0
 
-    # ----- 프리셋: 저장/불러오기 전용 -----
-    if "presets" not in st.session_state:
-        st.session_state["presets"] = {}
+    # ====== (교체) 프리셋 불러오기/적용 버튼 처리 ======
+if apply_btn and sel != "(선택)":
+    p = st.session_state["presets"][sel]
 
-    def current_params():
-        return {
-            "ST1_L": int(st.session_state["ST1_L"]),
-            "ST1_M": float(st.session_state["ST1_M"]),
-            "ST2_L": int(st.session_state["ST2_L"]),
-            "ST2_M": float(st.session_state["ST2_M"]),
-            "ST3_L": int(st.session_state["ST3_L"]),
-            "ST3_M": float(st.session_state["ST3_M"]),
-            "slippage_pct": float(st.session_state["slippage_pct"]),
-            "init_cap": float(st.session_state["init_cap"]),
-            "fill_policy": st.session_state["fill_policy"],
-        }
+    # 위젯 제약 정의
+    FILL_OPTIONS = ["당일 종가", "다음날 시가", "다음날 종가"]
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🧩 프리셋 (저장/불러오기)")
+    def clamp_int(v, lo, hi):
+        try:
+            v = int(round(float(v)))
+        except Exception:
+            v = lo
+        return max(lo, min(hi, v))
 
-    c1, c2 = st.sidebar.columns([2,1])
-    preset_name = c1.text_input("프리셋 이름", placeholder="예: TV_10-20-30", key="preset_name")
-    save_btn    = c2.button("저장", use_container_width=True)
+    def clamp_float(v, lo, hi):
+        try:
+            v = float(v)
+        except Exception:
+            v = lo
+        # 경계 내로
+        if np.isnan(v) or np.isinf(v):
+            v = lo
+        return max(lo, min(hi, v))
 
-    if save_btn and preset_name.strip():
-        st.session_state["presets"][preset_name.strip()] = current_params()
-        st.sidebar.success(f"저장됨: {preset_name.strip()}")
+    # 1) 기간(정수, [5,200])
+    st.session_state["ST1_L"] = clamp_int(p.get("ST1_L", 10), 5, 200)
+    st.session_state["ST2_L"] = clamp_int(p.get("ST2_L", 20), 5, 200)
+    st.session_state["ST3_L"] = clamp_int(p.get("ST3_L", 30), 5, 200)
 
-    opt_keys = ["(선택)"] + list(st.session_state["presets"].keys())
-    sel = st.sidebar.selectbox("프리셋 불러오기", options=opt_keys, index=0, key="preset_select")
-    apply_btn = st.sidebar.button("불러오기/적용", use_container_width=True)
+    # 2) 배수(실수, [0.5,10.0])
+    st.session_state["ST1_M"] = clamp_float(p.get("ST1_M", 3.0), 0.5, 10.0)
+    st.session_state["ST2_M"] = clamp_float(p.get("ST2_M", 4.0), 0.5, 10.0)
+    st.session_state["ST3_M"] = clamp_float(p.get("ST3_M", 5.0), 0.5, 10.0)
 
-    if apply_btn and sel != "(선택)":
-        p = st.session_state["presets"][sel]
-        for k, v in p.items():
-            st.session_state[k] = v
-        st.sidebar.success(f"적용됨: {sel}")
-        st.rerun()
+    # 3) 슬리피지%(실수, [0,5])
+    st.session_state["slippage_pct"] = clamp_float(p.get("slippage_pct", 0.1), 0.0, 5.0)
+
+    # 4) 초기자산(실수, [1, 1_000_000])
+    st.session_state["init_cap"] = clamp_float(p.get("init_cap", 100.0), 1.0, 1_000_000.0)
+
+    # 5) 체결시점(라디오 옵션 강제)
+    fp = p.get("fill_policy", "다음날 시가")
+    if fp not in FILL_OPTIONS:
+        fp = "다음날 시가"
+    st.session_state["fill_policy"] = fp
+
+    st.sidebar.success(f"적용됨: {sel}")
+    st.rerun()
+
 
     # ================= 실행 =================
     max_len = max(int(ST1_L), int(ST2_L), int(ST3_L))
