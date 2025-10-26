@@ -345,6 +345,12 @@ if uploaded:
     with tab1:
         if "presets" not in st.session_state:
             st.session_state["presets"] = {}
+
+        # ▶ 프리셋/디버그에서 펜딩한 bins가 있다면, 위젯 생성 전에 주입
+        if "_pending_vpvr_bins" in st.session_state:
+            st.session_state["VPVR_BINS"] = int(st.session_state["_pending_vpvr_bins"])
+            del st.session_state["_pending_vpvr_bins"]
+
         if "_pending_preset" in st.session_state:
             safe = sanitize_preset(st.session_state["_pending_preset"])
             st.session_state["use_st"] = safe["use_st"]
@@ -376,10 +382,14 @@ if uploaded:
         VWMA_L = st.sidebar.number_input("VWMA 기간", 2, 300, st.session_state.get("VWMA_L", 20), 1, key="VWMA_L")
 
         st.sidebar.header("⚙️ VPVR 파라미터")
-        st.sidebar.caption("백테스트는 고정 103봉(캔들) 롤링. 아래는 가격 축 분할 수입니다.")
-        VPVR_BINS = st.sidebar.number_input("VPVR 가로 bin 수", 20, 200, st.session_state.get("VPVR_BINS", 64), 1, key="VPVR_BINS")
-        # 세션에 저장(디버그 탭 기본값이 이 값을 사용)
-        st.session_state["VPVR_BINS"] = int(VPVR_BINS)
+        st.sidebar.caption("백테스트는 고정 103봉(캔들) 롤링. 아래는 가격 축 분할 수(Number of Rows)입니다.")
+        VPVR_BINS = st.sidebar.number_input(
+            "VPVR 가로 bin 수",
+            20, 200,
+            st.session_state.get("VPVR_BINS", 64), 1,
+            key="VPVR_BINS"  # 위젯이 세션 키 소유
+        )
+        vpvr_bins_val = int(VPVR_BINS)  # 사용 시 이 값 넘김
 
         st.sidebar.header("⚙️ 실행 설정")
         slippage_pct = st.sidebar.number_input("슬리피지(%)", 0.0, 5.0, st.session_state.get("slippage_pct", 0.1), 0.1, key="slippage_pct")
@@ -446,7 +456,7 @@ if uploaded:
                                 use_vwma=use_vwma,
                                 vwma_len=int(VWMA_L),
                                 use_vpvr=use_vpvr,
-                                vpvr_bins=int(st.session_state["VPVR_BINS"]),  # 동기화된 값 사용
+                                vpvr_bins=vpvr_bins_val,  # 동기화된 값 사용
                             )
 
                         st.subheader("📊 결과 요약")
@@ -493,7 +503,6 @@ if uploaded:
         if "Volume" not in data.columns:
             st.error("VPVR을 계산하려면 CSV에 'volume' 컬럼이 필요합니다.")
         else:
-            # 디버그 bins를 사이드바 값으로 동기화(기본값)
             dbg_bins_default = int(st.session_state.get("VPVR_BINS", 64))
             min_d = data.index[0].date()
             max_d = data.index[-1].date()
@@ -503,15 +512,18 @@ if uploaded:
                 "VPVR bins (가격 구간 수: Number of Rows)",
                 20, 200, dbg_bins_default, 1
             )
-            # 디버그에서 바꾼 값도 세션에 반영 → 사이드바와 동기화
-            st.session_state["VPVR_BINS"] = int(bins)
+
+            # ← 디버그에서 사이드바로 동기화 (다음 런에서 적용)
+            apply_dbg_bins = st.button("⬅️ 이 bins 값을 사이드바에도 적용")
+            if apply_dbg_bins:
+                st.session_state["_pending_vpvr_bins"] = int(bins)
+                st.rerun()
 
             run_dbg = st.button("🧮 선택한 최종일 기준, 마지막 103봉으로 VPVR 계산")
 
             if run_dbg:
                 end_ts = pd.Timestamp(end_date)
                 all_idx = data.index
-                # 최종일 이하에서 가장 가까운 인덱스
                 end_pos = all_idx.get_indexer([end_ts], method="pad")[0]
                 if end_pos == -1:
                     st.error("선택한 최종일 이전 데이터가 없습니다.")
