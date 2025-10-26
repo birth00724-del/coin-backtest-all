@@ -94,8 +94,16 @@ st.title("📊 SuperTrend 3중 결합 백테스트")
 uploaded_file = st.file_uploader("CSV 파일 업로드 (열: Date, Open, High, Low, Close, Volume)", type=['csv'])
 if uploaded_file:
     data = pd.read_csv(uploaded_file)
-    data['Date'] = pd.to_datetime(data['Date'])
-    data.set_index('Date', inplace=True)
+
+    # ---- 날짜 컬럼 자동 인식 ----
+    date_cols = [c for c in data.columns if c.lower() in ["date", "datetime", "time", "timestamp", "날짜"]]
+    if not date_cols:
+        st.error("❌ 날짜 컬럼을 찾을 수 없습니다. CSV에 'Date', 'datetime', 또는 '날짜' 열이 포함되어야 합니다.")
+        st.write("현재 CSV 컬럼명:", list(data.columns))
+        st.stop()
+
+    data[date_cols[0]] = pd.to_datetime(data[date_cols[0]])
+    data.set_index(date_cols[0], inplace=True)
     data = data.sort_index()
 
     st.sidebar.header("SuperTrend 파라미터 설정")
