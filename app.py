@@ -1,137 +1,160 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 
-# -------------------------------
-# SuperTrend 계산 함수
-# -------------------------------
+st.title("📈 Supertrend 3중 조합 백테스트 (1개라도 반대면 청산)")
+
+# ====== Supertrend 함수 ======
 def supertrend(df, period=10, multiplier=3):
     hl2 = (df['High'] + df['Low']) / 2
-    df['ATR'] = df['High'].combine(df['Low'], np.subtract).abs().rolling(period).mean()
+    df['TR'] = np.maximum(df['High'] - df['Low'],
+                          np.maximum(abs(df['High'] - df['Close'].shift(1)),
+                                     abs(df['Low'] - df['Close'].shift(1))))
+    df['ATR'] = df['TR'].rolling(period).mean()
     df['UpperBand'] = hl2 + (multiplier * df['ATR'])
     df['LowerBand'] = hl2 - (multiplier * df['ATR'])
+    df['Supertrend'] = True
 
-    trend = [True]
     for i in range(1, len(df)):
-        if df['Close'].iloc[i] > df['UpperBand'].iloc[i - 1]:
-            trend.append(True)
-        elif df['Close'].iloc[i] < df['LowerBand'].iloc[i - 1]:
-            trend.append(False)
+        if df['Close'][i] > df['UpperBand'][i - 1]:
+            df.loc[df.index[i], 'Supertrend'] = True
+        elif df['Close'][i] < df['LowerBand'][i - 1]:
+            df.loc[df.index[i], 'Supertrend'] = False
         else:
-            trend.append(trend[-1])
-            if trend[-1] and df['LowerBand'].iloc[i] < df['LowerBand'].iloc[i - 1]:
-                df.loc[df.index[i], 'LowerBand'] = df['LowerBand'].iloc[i - 1]
-            if not trend[-1] and df['UpperBand'].iloc[i] > df['UpperBand'].iloc[i - 1]:
-                df.loc[df.index[i], 'UpperBand'] = df['UpperBand'].iloc[i - 1]
-    df['Supertrend'] = np.where(trend, df['LowerBand'], df['UpperBand'])
-    df['Direction'] = np.where(df['Close'] >= df['Supertrend'], 1, -1)
+            df.loc[df.index[i], 'Supertrend'] = df['Supertrend'][i - 1]
+
+        # 밴드 조정
+        if df['Supertrend'][i]:
+            df.loc[df.index[i], 'LowerBand'] = max(df['LowerBand'][i], df['LowerBand'][i - 1])
+        else:
+            df.loc[df.index[i], 'UpperBand'] = min(df['UpperBand'][i], df['UpperBand'][i - 1])
     return df
 
-# -------------------------------
-# 백테스트 함수
-# -------------------------------
+# ====== 백테스트 함수 ======
 def backtest(df, st_params, slippage=0.001, initial_capital=1000000):
     st1 = supertrend(df.copy(), period=st_params[0][0], multiplier=st_params[0][1])
     st2 = supertrend(df.copy(), period=st_params[1][0], multiplier=st_params[1][1])
     st3 = supertrend(df.copy(), period=st_params[2][0], multiplier=st_params[2][1])
 
-    dir_df = pd.concat([st1['Direction'], st2['Direction'], st3['Direction']], axis=1)
-    dir_df.columns = ['ST1', 'ST2', 'ST3']
+    # 매수: 3개 모두 상승 / 매도: 1개라도 하락
+    df['BuySignal'] = (st1['Supertrend'] & st2['Supertrend'] & st3['Supertrend'])
+    df['SellSignal'] = (~st1['Supertrend']) | (~st2['Supertrend']) | (~st3['Supertrend'])
 
-    combined_signal = np.where(dir_df.sum(axis=1) == 3, 1, np.where(dir_df.sum(axis=1) == -3, -1, 0))
-    df['Signal'] = pd.Series(combined_signal, index=df.index)
-
-    # 매매 기록용 리스트
-    trades = []
     position = 0
-    entry_price = 0
+    buy_price = 0
     capital = initial_capital
-    equity_curve = []
+    trade_log = []
 
-    for i in range(1, len(df)):
-        signal = df['Signal'].iloc[i]
-        close = df['Close'].iloc[i]
+    for i in range(len(df)):
+        price = df['Close'][i]
 
-        if signal == 1 and position == 0:  # 진입
-            entry_price = close * (1 + slippage)
-            position = 1
-            entry_date = df.index[i]
-        elif signal == -1 and position == 1:  # 청산
-            exit_price = close * (1 - slippage)
-            exit_date = df.index[i]
-            ret = (exit_price - entry_price) / entry_price
-            capital *= (1 + ret)
-            trades.append({
-                '매수일': entry_date.strftime('%Y-%m-%d'),
-                '매수가': round(entry_price, 2),
-                '매도일': exit_date.strftime('%Y-%m-%d'),
-                '매도가': round(exit_price, 2),
-                '슬리피지 반영 수익률(%)': round(ret * 100, 2),
-                '자본 변화(원)': round(capital, 2)
-            })
+        # 매수 조건
+        if df['BuySignal'][i] and position == 0:
+            buy_price = price * (1 + slippage)
+            position = capital / buy_price
+            capital = 0
+            buy_date = df.index[i]
+
+        # 청산 조건 (1개라도 반대)
+        elif df['SellSignal'][i] and position > 0:
+            sell_price = price * (1 - slippage)
+            capital = position * sell_price
             position = 0
-        equity_curve.append(capital)
+            sell_date = df.index[i]
 
-    df['Equity'] = equity_curve + [capital] * (len(df) - len(equity_curve))
-    df['Equity'] = df['Equity'].ffill()
+            ret = (sell_price - buy_price) / buy_price
+            trade_log.append({
+                '매수일': buy_date.date(),
+                '매수가': round(buy_price, 2),
+                '매도일': sell_date.date(),
+                '매도가': round(sell_price, 2),
+                '수익률(%)': round(ret * 100, 2),
+                '자산': round(capital, 2)
+            })
 
-    total_return = df['Equity'].iloc[-1] / initial_capital - 1
-    years = (df.index[-1] - df.index[0]).days / 365
-    CAGR = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
-    drawdown = (df['Equity'] / df['Equity'].cummax() - 1).min()
-    returns = pd.Series(df['Equity']).pct_change().dropna()
-    sharpe = (returns.mean() / returns.std()) * np.sqrt(252) if not returns.empty else 0
+    # 마지막 포지션 정리
+    if position > 0:
+        capital = position * df['Close'].iloc[-1]
+        position = 0
 
-    trade_df = pd.DataFrame(trades)
-    return df, trade_df, CAGR, drawdown, sharpe
+    total_return = capital / initial_capital
+    years = (df.index[-1] - df.index[0]).days / 365.25
+    CAGR = (total_return ** (1 / years) - 1) * 100 if years > 0 else np.nan
 
-# -------------------------------
-# Streamlit UI
-# -------------------------------
-st.title("📊 SuperTrend 3중 결합 백테스트")
+    # MDD 계산
+    df['equity'] = np.maximum.accumulate(df['Close'] / df['Close'].iloc[0] * initial_capital)
+    df['drawdown'] = df['equity'] / df['equity'].cummax() - 1
+    MDD = df['drawdown'].min() * 100
 
-uploaded_file = st.file_uploader("CSV 파일 업로드 (열: Date, Open, High, Low, Close, Volume)", type=['csv'])
-if uploaded_file:
+    # Sharpe Ratio 계산
+    df['return'] = df['Close'].pct_change()
+    Sharpe = (df['return'].mean() / df['return'].std()) * np.sqrt(252)
+
+    trade_log_df = pd.DataFrame(trade_log)
+    return trade_log_df, CAGR, MDD, Sharpe
+
+# ====== Streamlit 인터페이스 ======
+uploaded_file = st.file_uploader("CSV 파일 업로드", type=["csv"])
+
+if uploaded_file is not None:
     data = pd.read_csv(uploaded_file)
 
-    # ---- 날짜 컬럼 자동 인식 ----
-    date_cols = [c for c in data.columns if c.lower() in ["date", "datetime", "time", "timestamp", "날짜"]]
-    if not date_cols:
-        st.error("❌ 날짜 컬럼을 찾을 수 없습니다. CSV에 'Date', 'datetime', 또는 '날짜' 열이 포함되어야 합니다.")
-        st.write("현재 CSV 컬럼명:", list(data.columns))
+    # ✅ 컬럼명 정규화
+    data.columns = [col.strip().capitalize() for col in data.columns]
+    rename_map = {
+        '날짜': 'Date', '시가': 'Open', '고가': 'High', '저가': 'Low', '종가': 'Close', '거래량': 'Volume'
+    }
+    data.rename(columns=rename_map, inplace=True)
+
+    # ✅ 필요한 컬럼 확인
+    required = ['Date', 'Open', 'High', 'Low', 'Close']
+    missing = [c for c in required if c not in data.columns]
+    if missing:
+        st.error(f"CSV에 다음 컬럼이 없습니다: {', '.join(missing)}")
         st.stop()
 
-    data[date_cols[0]] = pd.to_datetime(data[date_cols[0]])
-    data.set_index(date_cols[0], inplace=True)
-    data = data.sort_index()
+    # ✅ Date 처리
+    data['Date'] = pd.to_datetime(data['Date'])
+    data.set_index('Date', inplace=True)
 
-    st.sidebar.header("SuperTrend 파라미터 설정")
-    st1 = (st.sidebar.number_input("ST1 Period", 5, 50, 10),
-           st.sidebar.number_input("ST1 Multiplier", 1.0, 10.0, 3.0))
-    st2 = (st.sidebar.number_input("ST2 Period", 5, 50, 15),
-           st.sidebar.number_input("ST2 Multiplier", 1.0, 10.0, 4.0))
-    st3 = (st.sidebar.number_input("ST3 Period", 5, 50, 20),
-           st.sidebar.number_input("ST3 Multiplier", 1.0, 10.0, 5.0))
+    st.success("✅ 데이터 불러오기 완료")
 
-    slippage = st.sidebar.number_input("Slippage (예: 0.001 = 0.1%)", 0.0, 0.01, 0.001)
-    initial_capital = st.sidebar.number_input("초기자금 (원)", 100000, 100000000, 1000000)
+    # ===== Supertrend 파라미터 =====
+    st.subheader("Supertrend 설정")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st1_p = st.number_input("ST1 기간", 5, 50, 10)
+        st1_m = st.number_input("ST1 배수", 1.0, 10.0, 3.0)
+    with col2:
+        st2_p = st.number_input("ST2 기간", 5, 50, 20)
+        st2_m = st.number_input("ST2 배수", 1.0, 10.0, 4.0)
+    with col3:
+        st3_p = st.number_input("ST3 기간", 5, 50, 30)
+        st3_m = st.number_input("ST3 배수", 1.0, 10.0, 5.0)
 
-    if st.button("백테스트 실행"):
-        df_result, trade_log, CAGR, MDD, Sharpe = backtest(data, [st1, st2, st3], slippage, initial_capital)
+    slippage = st.number_input("슬리피지 비율", 0.0, 0.01, 0.001, format="%.4f")
+    initial_capital = st.number_input("초기자금", 100000, 10000000, 1000000, step=100000)
 
-        st.subheader("📈 백테스트 결과 요약")
-        st.write(f"**CAGR:** {CAGR*100:.2f}%")
-        st.write(f"**MDD:** {MDD*100:.2f}%")
+    if st.button("🚀 백테스트 실행"):
+        with st.spinner("계산 중..."):
+            trades, CAGR, MDD, Sharpe = backtest(
+                data, [(st1_p, st1_m), (st2_p, st2_m), (st3_p, st3_m)],
+                slippage, initial_capital
+            )
+
+        st.subheader("📊 결과 요약")
+        st.write(f"**CAGR:** {CAGR:.2f}%")
+        st.write(f"**MDD:** {MDD:.2f}%")
         st.write(f"**Sharpe Ratio:** {Sharpe:.2f}")
-        st.write(f"**총 거래 횟수:** {len(trade_log)}회")
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_result.index, y=df_result['Equity'], name='Equity', line=dict(color='blue')))
-        st.plotly_chart(fig, use_container_width=True)
+        st.subheader("🧾 매매 내역")
+        st.dataframe(trades)
 
-        st.subheader("📜 매매 내역")
-        st.dataframe(trade_log)
-
-        csv = trade_log.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 매매내역 다운로드 (CSV)", csv, "trade_log.csv", "text/csv")
+        if not trades.empty:
+            csv = trades.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="💾 매매 내역 다운로드",
+                data=csv,
+                file_name="trade_log.csv",
+                mime="text/csv"
+            )
